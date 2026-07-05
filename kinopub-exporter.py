@@ -19,7 +19,6 @@ TOKEN = os.environ.get("KINOPUB_TOKEN", TOKEN_PLACEHOLDER)
 USER_AGENT = "KinoPubWatchInfoExporter/1.0"
 
 CACHE_DB_FILE = Path(".kinopub_http_cache")
-CACHE_LAST_MODIFIED_FILE = Path(".kinopub_last_modified.json")
 CACHE_TTL_HOURS = 1
 OUTPUT_DIR = Path("data")
 WATCHLIST_OUTPUT_FILE = OUTPUT_DIR / "watchlist.json"
@@ -28,11 +27,15 @@ HISTORY_OUTPUT_FILE = OUTPUT_DIR / "history.json"
 REQUEST_TIMEOUT_SECONDS = 25
 MAX_RETRIES = 3
 BACKOFF_SECONDS = 1.0
+LOG_LEVEL = os.environ.get("KINOPUB_LOG_LEVEL", "INFO")
 
 IMDB_PATTERN = re.compile(r"^tt\d{7,10}$")
 
 MOVIE_TYPES = {"movie", "documovie"}
+THREE_D_TYPES = {"3d"}
 SHOW_TYPES = {"serial", "docuserial", "tvshow"}
+
+_logged_warning_keys: set[tuple[str, Optional[int], Optional[str]]] = set()
 
 
 def utc_now() -> datetime:
@@ -115,24 +118,111 @@ def normalize_imdb_id(value: Any) -> Optional[str]:
     return None
 
 
-def get_imdb_id_from_item(item: Dict[str, Any]) -> Optional[str]:
+def normalize_kinopoisk_id(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.isdigit():
+            return int(raw)
+    return None
+
+
+def extract_title_fields(
+    item: Dict[str, Any],
+    fallback_item: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    fallback = fallback_item if isinstance(fallback_item, dict) else {}
+
+    title = item.get("title") or fallback.get("title")
+    original_title = item.get("title_en") or fallback.get("title_en")
+
+    # KinoPub can store combined titles as "Localized / Original".
+    if isinstance(title, str):
+        title = title.strip() or None
+    if isinstance(original_title, str):
+        original_title = original_title.strip() or None
+
+    if not original_title and isinstance(title, str) and " / " in title:
+        left, right = [part.strip() for part in title.split(" / ", 1)]
+        if right and left != right:
+            title = left or title
+            original_title = right
+
+    if not original_title:
+        original_title = title
+
+    year = item.get("year")
+    if year is None:
+        year = fallback.get("year")
+
+    try:
+        normalized_year = int(year) if year is not None else None
+    except (TypeError, ValueError):
+        normalized_year = None
+
+    return title, original_title, normalized_year
+
+
+def log_identifier_warning_once(kind: str, kinopoisk_id: Optional[int], title: Optional[str], message: str) -> None:
+    key = (kind, kinopoisk_id, title)
+    if key in _logged_warning_keys:
+        return
+    _logged_warning_keys.add(key)
+    logging.warning(message)
+
+
+def warn_missing_metadata_if_needed(
+    title: Optional[str],
+    original_title: Optional[str],
+    year: Optional[int],
+    context: str,
+) -> None:
+    if original_title and year is not None:
+        return
+    missing = []
+    if not original_title:
+        missing.append("original_title")
+    if year is None:
+        missing.append("year")
+    logging.warning("%s item missing metadata (%s), title: %s", context, ", ".join(missing), title)
+
+
+def get_identifiers_from_items(
+    item: Dict[str, Any],
+    fallback_item: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[int]]:
     if not isinstance(item, dict):
         raise TypeError(f"Expected dict for item, got {type(item)}: {item}")
-    imdb_id = item.get("imdb")
-    if imdb_id is None:
-        if kinoposik_id := item.get("kinopoisk"):
-            logging.warning(
-                "Item missing IMDb ID but has Kinopoisk ID: %s, title: %s",
-                kinoposik_id,
-                item.get("title"),
-            )
-        else:
-            logging.warning(
-                "Item missing both IMDb and Kinopoisk IDs, title: %s",
-                item.get("title"),
-            )
-        return None
-    return normalize_imdb_id(imdb_id)
+
+    fallback = fallback_item if isinstance(fallback_item, dict) else {}
+    imdb_raw = item.get("imdb") if item.get("imdb") is not None else fallback.get("imdb")
+    kinopoisk_raw = item.get("kinopoisk") if item.get("kinopoisk") is not None else fallback.get("kinopoisk")
+
+    imdb_id = normalize_imdb_id(imdb_raw) if imdb_raw is not None else None
+    kinopoisk_id = normalize_kinopoisk_id(kinopoisk_raw)
+
+    title = item.get("title") or fallback.get("title")
+    if not imdb_id and kinopoisk_id is not None:
+        log_identifier_warning_once(
+            kind="missing_imdb_with_kp",
+            kinopoisk_id=kinopoisk_id,
+            title=title,
+            message=f"Item missing/invalid IMDb ID but has Kinopoisk ID: {kinopoisk_id}, title: {title}",
+        )
+    elif not imdb_id and kinopoisk_id is None:
+        log_identifier_warning_once(
+            kind="missing_both_ids",
+            kinopoisk_id=None,
+            title=title,
+            message=f"Item missing both IMDb and Kinopoisk IDs, title: {title}",
+        )
+
+    return imdb_id, kinopoisk_id
 
 
 def split_base_url_and_prefixes(base_url: str, prefixes: List[str]) -> Tuple[str, List[str]]:
@@ -178,32 +268,7 @@ class KinoPubClient:
             expire_after=timedelta(hours=CACHE_TTL_HOURS),
             allowable_methods=("GET",),
         )
-        self.last_modified_by_key = self._load_last_modified_state()
         self.preferred_prefix = self.detect_api_prefix()
-
-    def _request_key(self, endpoint: str, params: Optional[Dict[str, Any]]) -> str:
-        encoded_params = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        return f"{endpoint}?{encoded_params}"
-
-    def _load_last_modified_state(self) -> Dict[str, str]:
-        if not CACHE_LAST_MODIFIED_FILE.exists():
-            return {}
-        try:
-            with CACHE_LAST_MODIFIED_FILE.open("r", encoding="utf-8") as file_handle:
-                payload = json.load(file_handle)
-        except (OSError, json.JSONDecodeError):
-            logging.warning("Could not parse %s; starting with empty Last-Modified cache.", CACHE_LAST_MODIFIED_FILE)
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        return {str(k): str(v) for k, v in payload.items() if isinstance(v, str) and v}
-
-    def save_cache_state(self) -> None:
-        try:
-            with CACHE_LAST_MODIFIED_FILE.open("w", encoding="utf-8") as file_handle:
-                json.dump(self.last_modified_by_key, file_handle, ensure_ascii=False, indent=2)
-        except OSError as exc:
-            logging.warning("Failed to write Last-Modified cache state: %s", exc)
 
     def detect_api_prefix(self) -> str:
         """Detect the first API prefix that appears to be available."""
@@ -236,30 +301,15 @@ class KinoPubClient:
     ) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}{endpoint}"
         page = params.get("page") if isinstance(params, dict) else None
-        request_key = self._request_key(endpoint, params)
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                request_headers = dict(self.headers)
-                if_modified_since = self.last_modified_by_key.get(request_key)
-                if if_modified_since:
-                    request_headers["If-Modified-Since"] = if_modified_since
-
                 response = self.session.get(
                     url,
-                    headers=request_headers,
+                    headers=self.headers,
                     params=params,
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
-
-                if response.status_code == 304:
-                    logging.info("%s not modified; using cached copy when available.", endpoint)
-                    response = self.session.get(
-                        url,
-                        headers=self.headers,
-                        params=params,
-                        timeout=REQUEST_TIMEOUT_SECONDS,
-                    )
 
                 if response.status_code == 401:
                     logging.error("Authorization failed (401). Please verify KINOPUB_TOKEN.")
@@ -271,8 +321,6 @@ class KinoPubClient:
 
                 response.raise_for_status()
                 payload = response.json()
-                if last_modified := response.headers.get("Last-Modified"):
-                    self.last_modified_by_key[request_key] = last_modified
                 if getattr(response, "from_cache", False):
                     logging.debug("Cache hit for %s page=%s", endpoint, page)
                 return payload
@@ -323,11 +371,11 @@ def fetch_paginated_items(
             break
         got_any_page = True
         total_items = payload.get("pagination", {}).get("total_items")
-        logging.info("Fetched page %s: %s item(s) (total_fetched_items=%s/%s)", page, len(payload.get(items_key, [])), len(all_items), total_items)
         items = payload.get(items_key)
         if not isinstance(items, list) or not items:
             break
         all_items.extend(items)
+        logging.info("Fetched page %s: %s item(s) (total_fetched_items=%s/%s)", page, len(payload.get(items_key, [])), len(all_items), total_items)
         if len(items) < per_page:
             break
         page += 1
@@ -347,20 +395,16 @@ def get_watchlist(
         raise RuntimeError("Invalid /bookmarks response: missing 'items'.")
 
     watchlist = {"movies": [], "shows": []}
+    watchlist_env = os.environ.get("WATCHLIST_FOLDERS", "")
     accepted_folders = {
-        "watchlist",
-        "favorites",
-        "bookmarks",
-        "to watch",
-        "planned",
-        "буду смотреть",
-        "закладки",
-        "избранное",
+        value.strip().lower()
+        for value in watchlist_env.split(",")
+        if value.strip()
     }
 
     for folder in bookmarks.get("items", []):
         folder_title = str(folder.get("title", "")).strip().lower()
-        if folder_title not in accepted_folders:
+        if accepted_folders and folder_title not in accepted_folders:
             continue
 
         folder_id = folder.get("id")
@@ -378,27 +422,29 @@ def get_watchlist(
 
         for item in elements:
             item_type = item.get("type")
-            if item_type not in MOVIE_TYPES and item_type not in SHOW_TYPES:
+            if item_type not in MOVIE_TYPES and item_type not in THREE_D_TYPES and item_type not in SHOW_TYPES:
                 warn_unsupported(item_type, "watchlist")
                 continue
 
             if not should_include_by_timestamp(item.get("created"), since_dt, full_export):
                 continue
 
-            imdb_id = get_imdb_id_from_item(item)
-            if not imdb_id:
-                logging.warning(f"Skipping watchlist item with invalid IMDb ID: {imdb_id}, title: {item.get('title')}")
-                continue
+            imdb_id, kinopoisk_id = get_identifiers_from_items(item)
+            title, original_title, year = extract_title_fields(item)
+            if not imdb_id and kinopoisk_id is None:
+                warn_missing_metadata_if_needed(title, original_title, year, "Watchlist")
+                logging.debug("Missing metadata for watchlist item: %s", item)
 
             row = {
-                "title": item.get("title"),
-                "original_title": item.get("title_en"),
+                "title": title,
+                "original_title": original_title,
                 "imdb_id": imdb_id,
-                "kinopoisk_id": item.get("kinopoisk"),
+                "kinopoisk_id": kinopoisk_id,
+                "year": year,
                 "added_at": ts_to_iso_utc(item.get("created")),
             }
 
-            if item_type in MOVIE_TYPES:
+            if item_type in MOVIE_TYPES or item_type in THREE_D_TYPES:
                 watchlist["movies"].append(row)
             else:
                 watchlist["shows"].append(row)
@@ -467,7 +513,7 @@ def get_currently_watching(
     for item in items:
         item_type = item.get("type")
         if item_type not in SHOW_TYPES:
-            if item_type not in MOVIE_TYPES:
+            if item_type not in MOVIE_TYPES and item_type not in THREE_D_TYPES:
                 warn_unsupported(item_type, "currently_watching")
             continue
 
@@ -478,14 +524,10 @@ def get_currently_watching(
         if not should_include_by_timestamp(updated_ts, since_dt, full_export):
             continue
 
-        imdb_id = get_imdb_id_from_item(detail_item) or get_imdb_id_from_item(item)
-        if not imdb_id:
-            logging.warning(
-                "Skipping currently watching item with invalid IMDb ID: detail=%s list=%s",
-                detail_item.get("imdb"),
-                item.get("imdb"),
-            )
-            continue
+        imdb_id, kinopoisk_id = get_identifiers_from_items(detail_item, item)
+        title, original_title, year = extract_title_fields(item, detail_item)
+        if not imdb_id and kinopoisk_id is None:
+            warn_missing_metadata_if_needed(title, original_title, year, "Currently watching")
 
         last_season, last_episode, detail_updated_ts = extract_last_progress(detail_item)
         if last_season == 1 and last_episode == 1:
@@ -499,10 +541,11 @@ def get_currently_watching(
 
         currently_watching.append(
             {
-                "title": item.get("title") or detail_item.get("title"),
-                "original_title": item.get("title_en") or detail_item.get("title_en"),
+                "title": title,
+                "original_title": original_title,
                 "imdb_id": imdb_id,
-                "kinopoisk_id": detail_item.get("kinopoisk") or item.get("kinopoisk"),
+                "kinopoisk_id": kinopoisk_id,
+                "year": year,
                 "progress": {
                     "last_watched_season": last_season,
                     "last_watched_episode": last_episode,
@@ -526,7 +569,7 @@ def get_history(
     logging.info("Fetched raw history records: %s", len(history_items))
 
     result: List[Dict[str, Any]] = []
-    seen_movies: Dict[str, List[datetime]] = {}
+    seen_movies: Dict[Tuple[str, bool], List[datetime]] = {}
 
     for item in history_items:
         watched_ts = item.get("last_seen") or item.get("first_seen")
@@ -538,10 +581,10 @@ def get_history(
         item_meta: Dict[str, Any] = raw_item_meta if isinstance(raw_item_meta, dict) else {}
         media_meta: Dict[str, Any] = raw_media_meta if isinstance(raw_media_meta, dict) else {}
 
-        imdb_id = get_imdb_id_from_item(item_meta)
-        if not imdb_id:
-            logging.warning("Skipping history item with invalid IMDb ID: %s", item_meta.get("imdb"))
-            continue
+        imdb_id, kinopoisk_id = get_identifiers_from_items(item_meta)
+        title, original_title, year = extract_title_fields(item_meta)
+        if not imdb_id and kinopoisk_id is None:
+            warn_missing_metadata_if_needed(title, original_title, year, "History")
 
         item_type = item_meta.get("type")
         watched_at_dt = ts_to_dt_utc(watched_ts) or utc_now()
@@ -554,9 +597,11 @@ def get_history(
                 continue
             result.append(
                 {
-                    "title": item_meta.get("title"),
+                    "title": title,
+                    "original_title": original_title,
                     "imdb_id": imdb_id,
-                    "kinopoisk_id": item_meta.get("kinopoisk"),
+                    "kinopoisk_id": kinopoisk_id,
+                    "year": year,
                     "type": "show",
                     "season": season,
                     "episode": episode,
@@ -565,22 +610,27 @@ def get_history(
             )
             continue
 
-        if item_type in MOVIE_TYPES:
+        if item_type in MOVIE_TYPES or item_type in THREE_D_TYPES:
             video_title = str(media_meta.get("title", "")).lower()
             if any(marker in video_title for marker in ["trailer", "making of", "трейлер", "доп. материалы"]):
                 continue
 
-            timestamps = seen_movies.setdefault(imdb_id, [])
+            is_3d = item_type in THREE_D_TYPES
+            dedup_identifier = imdb_id or (f"kp:{kinopoisk_id}" if kinopoisk_id is not None else f"title:{title}|year:{year}")
+            timestamps = seen_movies.setdefault((dedup_identifier, is_3d), [])
             if any(abs(watched_at_dt - previous) < timedelta(hours=24) for previous in timestamps):
                 continue
             timestamps.append(watched_at_dt)
 
             result.append(
                 {
-                    "title": item_meta.get("title"),
+                    "title": title,
+                    "original_title": original_title,
                     "imdb_id": imdb_id,
-                    "kinopoisk_id": item_meta.get("kinopoisk"),
+                    "kinopoisk_id": kinopoisk_id,
+                    "year": year,
                     "type": "movie",
+                    "is_3d": is_3d,
                     "season": None,
                     "episode": None,
                     "watched_at": watched_at,
@@ -590,7 +640,7 @@ def get_history(
 
         warn_unsupported(item_type, "history")
 
-    logging.info("History exported after filtering: %s record(s).", len(result))
+    logging.info("History exported after filtering: %s record(s) from %s total.", len(result), len(history_items))
     return result
 
 
@@ -631,19 +681,26 @@ def parse_args() -> argparse.Namespace:
         default=TOKEN,
         help="Bearer token for KinoPub API (or use KINOPUB_TOKEN env var).",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=LOG_LEVEL,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level (or use KINOPUB_LOG_LEVEL env var).",
+    )
     return parser.parse_args()
 
 
-def setup_logging() -> None:
+def setup_logging(level_name: str) -> None:
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, level_name.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
 
 def main() -> int:
-    setup_logging()
     args = parse_args()
+    setup_logging(args.log_level)
 
     if not args.token or args.token == TOKEN_PLACEHOLDER:
         logging.error("A valid token is required. Set KINOPUB_TOKEN or pass --token.")
@@ -685,7 +742,6 @@ def main() -> int:
     write_output_json(WATCHLIST_OUTPUT_FILE, {"watchlist": watchlist})
     write_output_json(CURRENTLY_WATCHING_OUTPUT_FILE, {"currently_watching": currently_watching})
     write_output_json(HISTORY_OUTPUT_FILE, {"history": history})
-    client.save_cache_state()
 
     logging.info("Export completed successfully.")
     logging.info(
