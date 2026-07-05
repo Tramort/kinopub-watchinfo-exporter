@@ -1,0 +1,11 @@
+[project]
+name = "kinopub-watchinfo-exporter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.32.5",
+    "requests-cache>=1.2.1",
+    "traceback-with-variables>=2.2.1",
+]
