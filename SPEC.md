@@ -1,6 +1,6 @@
 # Kinopub-watchinfo-exporter
 
-Goals: export history, watchlist(currently watching series), favorites (to watch in future) from kinopub.
+Goals: export history, watchlist, and watching series data from kinopub.
 
 API doc: https://kinoapi.com
 Note: API may be outdated; implement version detection and fallback logic
@@ -16,6 +16,7 @@ Watching history:
     {
       "title": "Черное зеркало",
       "original_title": "Black Mirror",
+      "kinopub_id": 101,
       "imdb_id": "tt2085059",
       "kinopoisk_id": 655800,
       "year": 2011,
@@ -27,6 +28,7 @@ Watching history:
     {
       "title": "Интерстеллар",
       "original_title": "Interstellar",
+      "kinopub_id": 102,
       "imdb_id": "tt0816692",
       "kinopoisk_id": 258687,
       "year": 2014,
@@ -39,6 +41,7 @@ Watching history:
     {
       "title": "Аватар",
       "original_title": "Avatar",
+      "kinopub_id": 103,
       "imdb_id": "tt0499549",
       "kinopoisk_id": 251733,
       "year": 2009,
@@ -59,6 +62,7 @@ Watchilist:
       {
         "title": "Начало",
         "original_title": "Inception",
+        "kinopub_id": 201,
         "imdb_id": "tt1375666",
         "kinopoisk_id": 447301,
         "year": 2010,
@@ -67,6 +71,7 @@ Watchilist:
       {
         "title": "Аватар",
         "original_title": "Avatar",
+        "kinopub_id": 202,
         "imdb_id": "tt0499549",
         "kinopoisk_id": 251733,
         "year": 2009,
@@ -77,6 +82,7 @@ Watchilist:
       {
         "title": "Во все тяжкие",
         "original_title": "Breaking Bad",
+        "kinopub_id": 203,
         "imdb_id": "tt0903747",
         "kinopoisk_id": 404900,
         "year": 2008,
@@ -86,13 +92,14 @@ Watchilist:
   }
 }
 ```
-Currently Watching(only series):
+Watching (only series):
 ```
 {
-  "currently_watching": [
+  "watching": [
     {
       "title": "Пацаны",
       "original_title": "The Boys",
+      "kinopub_id": 301,
       "imdb_id": "tt1190634",
       "kinopoisk_id": 1113943,
       "year": 2019,
@@ -103,7 +110,8 @@ Currently Watching(only series):
       },
       "last_viewed_at": "2026-07-01T20:30:00Z"
     }
-  ]
+  ],
+  "dropped": []
 }
 ```
 
@@ -139,3 +147,41 @@ Sync Modes:
 - Titles: exporter writes `title` and `original_title`; when explicit original title is unavailable, it falls back to splitting
   combined KinoPub titles in the `"Localized / Original"` format.
 - 
+
+## Trakt Importer Mapping (PyTrakt)
+
+Implemented in `traktv-importer.py`.
+
+Scope:
+- Imports `data/history.json` to Trakt `sync/history`.
+- Imports `data/watchlist.json` to Trakt `sync/watchlist`.
+- Derives dropped-show candidates from `data/history.json` shows minus active `data/watching.json` `watching[]` and sends them to Trakt hidden dropped (`users/hidden/dropped`).
+- Authentication for live import uses cached tokens with refresh and falls back to Trakt OAuth Device Code Flow.
+
+Field mapping:
+- `history[].imdb_id` -> `ids.imdb`.
+- `history[].watched_at` -> `watched_at` (UTC ISO-8601 with `Z`).
+- `history[].type == "movie"` -> Trakt movie history entries.
+- `history[].type == "show"` with `season` and `episode` -> Trakt show/season/episode history entries.
+- `watchlist.movies[]` and `watchlist.shows[]` -> Trakt watchlist movie/show entries.
+- History show IMDb IDs not present in `watching.watching[]` (or TMDB-resolved IMDb) -> Trakt `users/hidden/dropped` show entries.
+
+Identifier policy:
+- Primary identifier is IMDb ID.
+- If IMDb is missing/invalid, importer attempts TMDB title/year lookup (when `TMDB_API_KEY` is provided) and then uses external IMDb ID.
+- Items unresolved to IMDb are skipped with warnings.
+
+3D compatibility:
+- KinoPub `is_3d` is treated as local metadata only.
+- Importer sends 3D watches to Trakt as standard movie history entries.
+
+Resilience and idempotency:
+- Importer deduplicates outgoing payloads before sync.
+- Retry with backoff is used for transient failures.
+- Rate-limit (429) is respected via retry-after handling.
+- Sync summary is written to `data/trakt_sync_state.json`.
+
+Device flow behavior:
+- Script first tries cached Trakt token from `data/trakt_token_cache.json` (or `--token-cache-file`).
+- If access token is expired, script attempts refresh via `/oauth/token`.
+- If cache/refresh cannot be used, script requests a device code from `/oauth/device/code` and polls `/oauth/device/token`.

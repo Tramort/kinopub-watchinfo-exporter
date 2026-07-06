@@ -22,7 +22,7 @@ CACHE_DB_FILE = Path(".kinopub_http_cache")
 CACHE_TTL_HOURS = 1
 OUTPUT_DIR = Path("data")
 WATCHLIST_OUTPUT_FILE = OUTPUT_DIR / "watchlist.json"
-CURRENTLY_WATCHING_OUTPUT_FILE = OUTPUT_DIR / "currently_watching.json"
+WATCHING_OUTPUT_FILE = OUTPUT_DIR / "watching.json"
 HISTORY_OUTPUT_FILE = OUTPUT_DIR / "history.json"
 REQUEST_TIMEOUT_SECONDS = 25
 MAX_RETRIES = 3
@@ -119,6 +119,20 @@ def normalize_imdb_id(value: Any) -> Optional[str]:
 
 
 def normalize_kinopoisk_id(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.isdigit():
+            return int(raw)
+    return None
+
+
+def normalize_kinopub_id(value: Any) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, int):
@@ -430,6 +444,7 @@ def get_watchlist(
                 continue
 
             imdb_id, kinopoisk_id = get_identifiers_from_items(item)
+            kinopub_id = normalize_kinopub_id(item.get("id"))
             title, original_title, year = extract_title_fields(item)
             if not imdb_id and kinopoisk_id is None:
                 warn_missing_metadata_if_needed(title, original_title, year, "Watchlist")
@@ -438,6 +453,7 @@ def get_watchlist(
             row = {
                 "title": title,
                 "original_title": original_title,
+                "kinopub_id": kinopub_id,
                 "imdb_id": imdb_id,
                 "kinopoisk_id": kinopoisk_id,
                 "year": year,
@@ -501,20 +517,63 @@ def extract_last_progress(detail_item: Dict[str, Any]) -> Tuple[int, int, Option
     return best_key[1], best_key[2], best_key[0] if best_key[0] > 0 else None
 
 
-def get_currently_watching(
+def build_history_identifier_index(
+    history_items: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    index: Dict[int, Dict[str, Any]] = {}
+    for row in history_items:
+        if not isinstance(row, dict):
+            continue
+        kinopub_id = normalize_kinopub_id(row.get("kinopub_id"))
+        if kinopub_id is None:
+            continue
+        if kinopub_id in index:
+            continue
+        index[kinopub_id] = {
+            "imdb_id": row.get("imdb_id"),
+            "kinopoisk_id": row.get("kinopoisk_id"),
+            "title": row.get("title"),
+            "original_title": row.get("original_title"),
+            "year": row.get("year"),
+        }
+    return index
+
+
+def get_watching(
     client: KinoPubClient,
     since_dt: Optional[datetime],
     full_export: bool,
-) -> List[Dict[str, Any]]:
-    logging.info("Exporting currently watching shows...")
-    items = fetch_paginated_items(client, "/watching/serials", per_page=50)
-    currently_watching: List[Dict[str, Any]] = []
+    history_identifier_index: Dict[int, Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    logging.info("Exporting watching shows...")
+    subscribed_items = fetch_paginated_items(
+        client,
+        "/watching/serials",
+        per_page=50,
+        extra_params={"subscribed": 1},
+    )
+    all_items = fetch_paginated_items(client, "/watching/serials", per_page=50)
 
-    for item in items:
+    subscribed_ids = {
+        normalize_kinopub_id(item.get("id"))
+        for item in subscribed_items
+        if normalize_kinopub_id(item.get("id")) is not None
+    }
+
+    dropped_items = [
+        item
+        for item in all_items
+        if normalize_kinopub_id(item.get("id")) not in subscribed_ids
+    ]
+
+    watching: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+
+    for item in subscribed_items + dropped_items:
         item_type = item.get("type")
         if item_type not in SHOW_TYPES:
             if item_type not in MOVIE_TYPES and item_type not in THREE_D_TYPES:
-                warn_unsupported(item_type, "currently_watching")
+                warn_unsupported(item_type, "watching")
             continue
 
         details = client.request("/watching", params={"id": item.get("id")}) if item.get("id") else None
@@ -524,10 +583,27 @@ def get_currently_watching(
         if not should_include_by_timestamp(updated_ts, since_dt, full_export):
             continue
 
+        kinopub_id = normalize_kinopub_id(detail_item.get("id"))
+        if kinopub_id is None:
+            kinopub_id = normalize_kinopub_id(item.get("id"))
+
         imdb_id, kinopoisk_id = get_identifiers_from_items(detail_item, item)
+        if kinopub_id is not None and (not imdb_id or kinopoisk_id is None):
+            history_identifiers = history_identifier_index.get(kinopub_id)
+            if history_identifiers:
+                imdb_id = imdb_id or history_identifiers.get("imdb_id")
+                kinopoisk_id = kinopoisk_id if kinopoisk_id is not None else history_identifiers.get("kinopoisk_id")
+
         title, original_title, year = extract_title_fields(item, detail_item)
+        if kinopub_id is not None:
+            history_identifiers = history_identifier_index.get(kinopub_id)
+            if history_identifiers:
+                title = title or history_identifiers.get("title")
+                original_title = original_title or history_identifiers.get("original_title")
+                year = year if year is not None else history_identifiers.get("year")
+
         if not imdb_id and kinopoisk_id is None:
-            warn_missing_metadata_if_needed(title, original_title, year, "Currently watching")
+            warn_missing_metadata_if_needed(title, original_title, year, "Watching")
 
         last_season, last_episode, detail_updated_ts = extract_last_progress(detail_item)
         if last_season == 1 and last_episode == 1:
@@ -539,24 +615,28 @@ def get_currently_watching(
         if detail_updated_ts:
             updated_ts = updated_ts or detail_updated_ts
 
-        currently_watching.append(
-            {
-                "title": title,
-                "original_title": original_title,
-                "imdb_id": imdb_id,
-                "kinopoisk_id": kinopoisk_id,
-                "year": year,
-                "progress": {
-                    "last_watched_season": last_season,
-                    "last_watched_episode": last_episode,
-                    "is_finished": int(item.get("new") or 0) == 0 and int(item.get("total") or 0) > 0,
-                },
-                "last_viewed_at": ts_to_iso_utc(updated_ts),
-            }
-        )
+        row = {
+            "title": title,
+            "original_title": original_title,
+            "kinopub_id": kinopub_id,
+            "imdb_id": imdb_id,
+            "kinopoisk_id": kinopoisk_id,
+            "year": year,
+            "progress": {
+                "last_watched_season": last_season,
+                "last_watched_episode": last_episode,
+                "is_finished": int(item.get("new") or 0) == 0 and int(item.get("total") or 0) > 0,
+            },
+            "last_viewed_at": ts_to_iso_utc(updated_ts),
+        }
 
-    logging.info("Currently watching exported: %s show(s).", len(currently_watching))
-    return currently_watching
+        if kinopub_id is not None and kinopub_id not in subscribed_ids:
+            dropped.append(row)
+        else:
+            watching.append(row)
+
+    logging.info("Watching exported: %s active show(s), %s dropped show(s).", len(watching), len(dropped))
+    return {"watching": watching, "dropped": dropped}
 
 
 def get_history(
@@ -582,6 +662,10 @@ def get_history(
         media_meta: Dict[str, Any] = raw_media_meta if isinstance(raw_media_meta, dict) else {}
 
         imdb_id, kinopoisk_id = get_identifiers_from_items(item_meta)
+        kinopub_id = normalize_kinopub_id(item_meta.get("id"))
+        if kinopub_id is None:
+            kinopub_id = normalize_kinopub_id(item.get("id"))
+
         title, original_title, year = extract_title_fields(item_meta)
         if not imdb_id and kinopoisk_id is None:
             warn_missing_metadata_if_needed(title, original_title, year, "History")
@@ -599,6 +683,7 @@ def get_history(
                 {
                     "title": title,
                     "original_title": original_title,
+                    "kinopub_id": kinopub_id,
                     "imdb_id": imdb_id,
                     "kinopoisk_id": kinopoisk_id,
                     "year": year,
@@ -613,12 +698,14 @@ def get_history(
         if item_type in MOVIE_TYPES or item_type in THREE_D_TYPES:
             video_title = str(media_meta.get("title", "")).lower()
             if any(marker in video_title for marker in ["trailer", "making of", "трейлер", "доп. материалы"]):
+                logging.debug("Skipping history item with trailer/extra content: %s", video_title)
                 continue
 
             is_3d = item_type in THREE_D_TYPES
             dedup_identifier = imdb_id or (f"kp:{kinopoisk_id}" if kinopoisk_id is not None else f"title:{title}|year:{year}")
             timestamps = seen_movies.setdefault((dedup_identifier, is_3d), [])
             if any(abs(watched_at_dt - previous) < timedelta(hours=24) for previous in timestamps):
+                logging.debug("Skipping duplicate history item within 24 hours: %s", title)
                 continue
             timestamps.append(watched_at_dt)
 
@@ -626,6 +713,7 @@ def get_history(
                 {
                     "title": title,
                     "original_title": original_title,
+                    "kinopub_id": kinopub_id,
                     "imdb_id": imdb_id,
                     "kinopoisk_id": kinopoisk_id,
                     "year": year,
@@ -733,21 +821,27 @@ def main() -> int:
 
     try:
         watchlist = get_watchlist(client, since_dt=since_dt, full_export=args.full)
-        currently_watching = get_currently_watching(client, since_dt=since_dt, full_export=args.full)
         history = get_history(client, since_dt=since_dt, full_export=args.full)
+        history_identifier_index = build_history_identifier_index(history)
+        watching = get_watching(
+            client,
+            since_dt=since_dt,
+            full_export=args.full,
+            history_identifier_index=history_identifier_index,
+        )
     except RuntimeError as exc:
         logging.error("Export aborted: %s", exc)
         return 1
 
     write_output_json(WATCHLIST_OUTPUT_FILE, {"watchlist": watchlist})
-    write_output_json(CURRENTLY_WATCHING_OUTPUT_FILE, {"currently_watching": currently_watching})
+    write_output_json(WATCHING_OUTPUT_FILE, watching)
     write_output_json(HISTORY_OUTPUT_FILE, {"history": history})
 
     logging.info("Export completed successfully.")
     logging.info(
         "Generated files: %s, %s, %s",
         WATCHLIST_OUTPUT_FILE,
-        CURRENTLY_WATCHING_OUTPUT_FILE,
+        WATCHING_OUTPUT_FILE,
         HISTORY_OUTPUT_FILE,
     )
     return 0

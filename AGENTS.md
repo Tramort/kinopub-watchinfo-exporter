@@ -36,7 +36,7 @@ Not part of exporter flow:
 Generated outputs:
 - [data/history.json](data/history.json)
 - [data/watchlist.json](data/watchlist.json)
-- [data/currently_watching.json](data/currently_watching.json)
+- [data/watching.json](data/watching.json)
 
 ## Project Conventions
 
