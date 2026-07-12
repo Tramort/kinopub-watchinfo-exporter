@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ DEFAULT_WATCHLIST_FILE = Path("data/watchlist.json")
 DEFAULT_WATCHING_FILE = Path("data/watching.json")
 DEFAULT_STATE_FILE = Path("data/trakt_sync_state.json")
 DEFAULT_TOKEN_CACHE_FILE = Path("data/trakt_token_cache.json")
+DEFAULT_MISMATCH_APPROVE_CACHE_FILE = Path("data/trakt_mismatch_approvals.json")
 DEFAULT_TRAKT_BASE_URL = "https://api.trakt.tv/"
 DEFAULT_TMDB_BASE_URL = "https://api.themoviedb.org/3"
 DEFAULT_RATE_LIMIT_DELAY = 1.1
@@ -25,6 +27,9 @@ DEFAULT_BATCH_SIZE = 100
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = 1.0
 DEFAULT_DEVICE_AUTH_TIMEOUT = 900
+DEFAULT_MISMATCH_MODE = "approve"
+DEFAULT_MISMATCH_MAX_GAP = 1
+MISMATCH_HEURISTIC_VERSION = "v1"
 
 IMDB_PATTERN = re.compile(r"^tt\d{7,10}$")
 
@@ -112,6 +117,31 @@ class BuildStats:
     enriched: int = 0
 
 
+@dataclass
+class MismatchStats:
+    proposals_infer: int = 0
+    proposals_drop: int = 0
+    applied_infer: int = 0
+    applied_drop: int = 0
+    skipped_unapproved: int = 0
+    skipped_rejected: int = 0
+    unresolved: int = 0
+
+
+@dataclass
+class MismatchProposal:
+    action_type: str
+    fingerprint: str
+    imdb_id: str
+    title: str
+    season: Optional[int]
+    source_episode: Optional[int]
+    inferred_episodes: List[int]
+    watched_at: Optional[str]
+    kinopub_season_count: Optional[int] = None
+    trakt_season_count: Optional[int] = None
+
+
 class TMDBResolver:
     def __init__(self, api_key: Optional[str], base_url: str = DEFAULT_TMDB_BASE_URL, timeout: int = 15) -> None:
         self.api_key = api_key
@@ -144,43 +174,55 @@ class TMDBResolver:
 
         search_kind = "movie" if media_type == "movie" else "tv"
         year_param = "year" if media_type == "movie" else "first_air_date_year"
+        year_candidates: List[Optional[int]] = [None]
+        if isinstance(year, int):
+            year_candidates = [year, year - 1, year + 1]
 
         for query in candidates:
-            params: Dict[str, Any] = {"api_key": self.api_key, "query": query}
-            if isinstance(year, int):
-                params[year_param] = year
-            try:
-                response = self.session.get(
-                    f"{self.base_url}/search/{search_kind}",
-                    params=params,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                payload = response.json()
-            except (requests.RequestException, ValueError) as exc:
-                logging.warning(
-                    "TMDB search failed for %s '%s' (year=%s): %s",
-                    search_kind,
-                    query,
-                    year,
-                    redact_tmdb_key_in_text(str(exc), self.api_key),
-                )
-                continue
-
-            results = payload.get("results")
-            if not isinstance(results, list):
-                continue
-
-            for item in results[:5]:
-                if not isinstance(item, dict):
+            for search_year in year_candidates:
+                params: Dict[str, Any] = {"api_key": self.api_key, "query": query}
+                if isinstance(search_year, int):
+                    params[year_param] = search_year
+                try:
+                    response = self.session.get(
+                        f"{self.base_url}/search/{search_kind}",
+                        params=params,
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                except (requests.RequestException, ValueError) as exc:
+                    logging.warning(
+                        "TMDB search failed for %s '%s' (year=%s): %s",
+                        search_kind,
+                        query,
+                        search_year,
+                        redact_tmdb_key_in_text(str(exc), self.api_key),
+                    )
                     continue
-                tmdb_id = item.get("id")
-                if not isinstance(tmdb_id, int):
+
+                results = payload.get("results")
+                if not isinstance(results, list):
                     continue
-                imdb_id = self._lookup_external_imdb(search_kind, tmdb_id)
-                normalized = normalize_imdb_id(imdb_id)
-                if normalized:
-                    return normalized
+
+                for item in results[:5]:
+                    if not isinstance(item, dict):
+                        continue
+                    tmdb_id = item.get("id")
+                    if not isinstance(tmdb_id, int):
+                        continue
+                    imdb_id = self._lookup_external_imdb(search_kind, tmdb_id)
+                    normalized = normalize_imdb_id(imdb_id)
+                    if normalized:
+                        if isinstance(search_year, int) and search_year != year:
+                            logging.info(
+                                "TMDB resolved IMDb via year fallback: query=%s requested_year=%s matched_year=%s imdb=%s",
+                                query,
+                                year,
+                                search_year,
+                                normalized,
+                            )
+                        return normalized
         return None
 
     def _lookup_external_imdb(self, search_kind: str, tmdb_id: int) -> Optional[str]:
@@ -279,6 +321,448 @@ class TraktClient:
                 time.sleep(sleep_for)
 
         return {}
+
+    def get_with_retry(
+        self,
+        endpoint: str,
+        *,
+        retries: int,
+        backoff_seconds: float,
+        rate_limit_delay: float,
+    ) -> Any:
+        for attempt in range(1, retries + 1):
+            try:
+                response = self.client.get(endpoint)
+                time.sleep(rate_limit_delay)
+                return response
+            except trakt_errors.OAuthException:
+                raise
+            except trakt_errors.RateLimitException as exc:
+                if attempt >= retries:
+                    raise
+                sleep_for = max(rate_limit_delay, float(exc.retry_after))
+                logging.warning(
+                    "Rate limited while requesting %s (attempt %s/%s). Sleeping %.1fs.",
+                    endpoint,
+                    attempt,
+                    retries,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            except (trakt_errors.TraktInternalException, trakt_errors.TraktBadGateway, trakt_errors.TraktUnavailable) as exc:
+                if attempt >= retries:
+                    raise
+                sleep_for = backoff_seconds * attempt
+                logging.warning(
+                    "Trakt temporary error for %s (attempt %s/%s): %s. Sleeping %.1fs.",
+                    endpoint,
+                    attempt,
+                    retries,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            except (trakt_errors.TraktException, requests.RequestException) as exc:
+                if attempt >= retries:
+                    raise
+                sleep_for = backoff_seconds * attempt
+                logging.warning(
+                    "Request error for %s (attempt %s/%s): %s. Sleeping %.1fs.",
+                    endpoint,
+                    attempt,
+                    retries,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+        return None
+
+    def get_show_season_episode_counts(
+        self,
+        imdb_id: str,
+        *,
+        retries: int,
+        backoff_seconds: float,
+        rate_limit_delay: float,
+    ) -> Optional[Dict[int, int]]:
+        endpoint = f"shows/{imdb_id}/seasons?extended=episodes"
+        try:
+            payload = self.get_with_retry(
+                endpoint,
+                retries=retries,
+                backoff_seconds=backoff_seconds,
+                rate_limit_delay=rate_limit_delay,
+            )
+        except (trakt_errors.TraktException, requests.RequestException) as exc:
+            logging.warning("Failed to fetch season metadata for %s: %s", imdb_id, exc)
+            return None
+
+        if not isinstance(payload, list):
+            logging.warning("Unexpected season metadata payload for %s", imdb_id)
+            return None
+
+        season_counts: Dict[int, int] = {}
+        for season in payload:
+            if not isinstance(season, dict):
+                continue
+            season_number = season.get("number")
+            episodes = season.get("episodes")
+            if not isinstance(season_number, int) or season_number <= 0 or not isinstance(episodes, list):
+                continue
+
+            max_episode = 0
+            for episode in episodes:
+                if not isinstance(episode, dict):
+                    continue
+                episode_number = episode.get("number")
+                if isinstance(episode_number, int) and episode_number > max_episode:
+                    max_episode = episode_number
+            if max_episode > 0:
+                season_counts[season_number] = max_episode
+
+        return season_counts
+
+
+def make_infer_fingerprint(imdb_id: str, season: int, source_episode: int, inferred_episodes: List[int]) -> str:
+    episodes = ",".join(str(number) for number in inferred_episodes)
+    return f"infer|{MISMATCH_HEURISTIC_VERSION}|{imdb_id}|s{season}|e{source_episode}|{episodes}"
+
+
+def make_drop_fingerprint(imdb_id: str) -> str:
+    return f"drop|{MISMATCH_HEURISTIC_VERSION}|{imdb_id}"
+
+
+def load_mismatch_approval_cache(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    approvals = payload.get("approvals") if isinstance(payload, dict) else None
+    if not isinstance(approvals, dict):
+        return {}
+    return {key: value for key, value in approvals.items() if isinstance(key, str) and isinstance(value, dict)}
+
+
+def save_mismatch_approval_cache(path: Path, approvals: Dict[str, Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": dt_to_iso_z(datetime.now(tz=timezone.utc)),
+        "heuristic_version": MISMATCH_HEURISTIC_VERSION,
+        "approvals": approvals,
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def flatten_payload_items(payloads: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for payload in payloads:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict):
+                items.append(item)
+    return items
+
+
+def build_payloads_from_items(items: List[Dict[str, Any]], key: str, batch_size: int) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for part in chunked(items, batch_size):
+        payloads.append({key: part})
+    return payloads
+
+
+def dedupe_show_history_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    dedup_keys = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in items:
+        ids = item.get("ids")
+        seasons = item.get("seasons")
+        if not isinstance(ids, dict) or not isinstance(seasons, list) or not seasons:
+            continue
+        imdb_id = ids.get("imdb")
+        season_payload = seasons[0] if isinstance(seasons[0], dict) else None
+        if not isinstance(imdb_id, str) or not isinstance(season_payload, dict):
+            continue
+        season_number = season_payload.get("number")
+        episodes = season_payload.get("episodes")
+        if not isinstance(season_number, int) or not isinstance(episodes, list) or not episodes:
+            continue
+        episode_payload = episodes[0] if isinstance(episodes[0], dict) else None
+        if not isinstance(episode_payload, dict):
+            continue
+        episode_number = episode_payload.get("number")
+        watched_at = episode_payload.get("watched_at")
+        if not isinstance(episode_number, int) or not isinstance(watched_at, str):
+            continue
+        dedup_key = (imdb_id, season_number, episode_number, watched_at)
+        if dedup_key in dedup_keys:
+            continue
+        dedup_keys.add(dedup_key)
+        deduped.append(item)
+    return deduped
+
+
+def dedupe_show_id_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    dedup_ids = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in items:
+        ids = item.get("ids")
+        if not isinstance(ids, dict):
+            continue
+        imdb_id = ids.get("imdb")
+        if not isinstance(imdb_id, str):
+            continue
+        if imdb_id in dedup_ids:
+            continue
+        dedup_ids.add(imdb_id)
+        deduped.append(item)
+    return deduped
+
+
+def build_show_season_progress_from_history(
+    history_items: List[Dict[str, Any]],
+) -> Dict[str, Dict[int, Tuple[int, str]]]:
+    progress: Dict[str, Dict[int, Tuple[int, str]]] = {}
+    for row in history_items:
+        if row.get("type") != "show":
+            continue
+
+        imdb_id = row.get("imdb_id")
+        season = row.get("season")
+        episode = row.get("episode")
+        watched_at = row.get("watched_at")
+        if not isinstance(imdb_id, str) or not isinstance(season, int) or not isinstance(episode, int):
+            continue
+        if season <= 0 or episode <= 0 or not isinstance(watched_at, str):
+            continue
+
+        season_progress = progress.setdefault(imdb_id, {})
+        current = season_progress.get(season)
+        if current is None or episode > current[0]:
+            season_progress[season] = (episode, watched_at)
+
+    return progress
+
+
+def build_mismatch_proposals(
+    watching_payload: Dict[str, List[Dict[str, Any]]],
+    history_items: List[Dict[str, Any]],
+    *,
+    resolver: TMDBResolver,
+    trakt_client: TraktClient,
+    retries: int,
+    backoff_seconds: float,
+    rate_limit_delay: float,
+    max_gap: int,
+) -> Tuple[List[MismatchProposal], MismatchStats]:
+    stats = MismatchStats()
+    proposals: List[MismatchProposal] = []
+    seen_fingerprints = set()
+    season_count_cache: Dict[str, Optional[Dict[int, int]]] = {}
+    history_season_progress = build_show_season_progress_from_history(history_items)
+
+    logging.info("Building mismatch proposals from watching payload...")
+    watching_rows = watching_payload.get("watching", [])
+    for row_index, row in enumerate(watching_rows, start=1):
+        logging.info("Processing watching entry: %s/%s", row_index, len(watching_rows))
+        progress = row.get("progress")
+        if not isinstance(progress, dict) or progress.get("is_finished") is not True:
+            continue
+
+        imdb_id, _ = resolve_or_skip_imdb(item=row, media_type="show", resolver=resolver)
+        if not imdb_id:
+            continue
+
+        last_season = progress.get("last_watched_season")
+        last_episode = progress.get("last_watched_episode")
+        watched_dt = parse_iso_utc(row.get("last_viewed_at"))
+        if not isinstance(last_season, int) or not isinstance(last_episode, int) or last_season <= 0 or last_episode <= 0:
+            continue
+        if watched_dt is None:
+            continue
+        last_viewed_at = dt_to_iso_z(watched_dt)
+
+        if imdb_id not in season_count_cache:
+            season_count_cache[imdb_id] = trakt_client.get_show_season_episode_counts(
+                imdb_id,
+                retries=retries,
+                backoff_seconds=backoff_seconds,
+                rate_limit_delay=rate_limit_delay,
+            )
+        season_counts = season_count_cache.get(imdb_id)
+        if not isinstance(season_counts, dict):
+            continue
+
+        title: str = row.get("title", imdb_id) if isinstance(row.get("title"), str) else imdb_id
+        trakt_season_count = max(season_counts)
+        if last_season > trakt_season_count:
+            logging.info(
+                "Season count mismatch for %s (%s): KinoPub=%s Trakt=%s",
+                title,
+                imdb_id,
+                last_season,
+                trakt_season_count,
+            )
+            fingerprint = make_drop_fingerprint(imdb_id)
+            if fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
+                proposals.append(
+                    MismatchProposal(
+                        action_type="drop_season_count_mismatch",
+                        fingerprint=fingerprint,
+                        imdb_id=imdb_id,
+                        title=title,
+                        season=last_season,
+                        source_episode=last_episode,
+                        inferred_episodes=[],
+                        watched_at=last_viewed_at,
+                        kinopub_season_count=last_season,
+                        trakt_season_count=trakt_season_count,
+                    )
+                )
+                stats.proposals_drop += 1
+            continue
+
+        show_history = history_season_progress.get(imdb_id, {})
+        last_season_drop_needed = False
+
+        for season in range(1, last_season + 1):
+            if season == last_season:
+                source_episode = last_episode
+                season_watched_at = last_viewed_at
+            else:
+                season_progress = show_history.get(season)
+                if season_progress is None:
+                    logging.info(
+                        "Skipping mismatch check for %s S%s: no KinoPub history for season",
+                        imdb_id,
+                        season,
+                    )
+                    continue
+                source_episode, season_watched_at = season_progress
+
+            trakt_max_episode = season_counts.get(season)
+            if not isinstance(trakt_max_episode, int) or trakt_max_episode <= 0:
+                continue
+
+            if source_episode == trakt_max_episode:
+                # Same final episode as Trakt for this season: not a mismatch.
+                continue
+
+            if source_episode > trakt_max_episode:
+                logging.info(
+                    "Episode progress beyond Trakt catalog for %s (%s): KinoPub S%sE%s > Trakt S%sE%s",
+                    title,
+                    imdb_id,
+                    season,
+                    source_episode,
+                    season,
+                    trakt_max_episode,
+                )
+                continue
+
+            gap = trakt_max_episode - source_episode
+            if gap <= max_gap:
+                inferred_episodes = list(range(source_episode + 1, trakt_max_episode + 1))
+                fingerprint = make_infer_fingerprint(imdb_id, season, source_episode, inferred_episodes)
+                if fingerprint in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fingerprint)
+                proposals.append(
+                    MismatchProposal(
+                        action_type="infer_tail_episodes",
+                        fingerprint=fingerprint,
+                        imdb_id=imdb_id,
+                        title=title,
+                        season=season,
+                        source_episode=source_episode,
+                        inferred_episodes=inferred_episodes,
+                        watched_at=season_watched_at,
+                    )
+                )
+                stats.proposals_infer += 1
+                continue
+
+            if season == last_season:
+                last_season_drop_needed = True
+
+        if not last_season_drop_needed:
+            continue
+
+        fingerprint = make_drop_fingerprint(imdb_id)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        proposals.append(
+            MismatchProposal(
+                action_type="drop_finished_no_candidates",
+                fingerprint=fingerprint,
+                imdb_id=imdb_id,
+                title=title,
+                season=last_season,
+                source_episode=last_episode,
+                inferred_episodes=[],
+                watched_at=last_viewed_at,
+            )
+        )
+        stats.proposals_drop += 1
+
+    return proposals, stats
+
+
+def explain_mismatch_proposal(proposal: MismatchProposal) -> str:
+    if proposal.action_type == "infer_tail_episodes":
+        inferred = ",".join(str(number) for number in proposal.inferred_episodes)
+        return (
+            f"Finished show episode numbering differs: KinoPub ended at "
+            f"S{proposal.season}E{proposal.source_episode}, inferred Trakt tail episodes [{inferred}] "
+            f"for the same season."
+        )
+    if proposal.action_type == "drop_season_count_mismatch":
+        return (
+            f"Finished show season count differs: KinoPub has {proposal.kinopub_season_count} season(s), "
+            f"Trakt has {proposal.trakt_season_count}; proposal is to hide the show as dropped."
+        )
+    return (
+        f"Finished show has no safe tail-mismatch inference candidate at "
+        f"S{proposal.season}E{proposal.source_episode}; proposal is to hide the show as dropped."
+    )
+
+
+def resolve_mismatch_proposal_interactive(proposal: MismatchProposal, current_decision: Optional[str]) -> Optional[str]:
+    if current_decision in {"approved", "rejected"}:
+        return current_decision
+
+    if not sys.stdin.isatty():
+        logging.warning(
+            "Proposal %s is unresolved and no interactive terminal is available.",
+            proposal.fingerprint,
+        )
+        return None
+
+    prompt = (
+        f"Resolve proposal for {proposal.title} [{proposal.fingerprint}] "
+        "[A=approve (default), R=reject, D=defer]: "
+    )
+    while True:
+        try:
+            raw = input(prompt).strip().lower()
+        except EOFError:
+            logging.warning("Reached EOF while waiting for proposal decision: %s", proposal.fingerprint)
+            return None
+        if raw in {"", "a", "approve"}:
+            return "approved"
+        if raw in {"r", "reject"}:
+            return "rejected"
+        if raw in {"d", "defer", "u", "unresolved"}:
+            return None
+        print("Please enter A, R, or D.")
 
 
 def get_oauth_token_via_device_flow(
@@ -596,7 +1080,6 @@ def build_watchlist_payloads(
 
 
 def build_dropped_show_remove_payloads(
-    history_items: List[Dict[str, Any]],
     watching_payload: Dict[str, List[Dict[str, Any]]],
     *,
     batch_size: int,
@@ -607,18 +1090,7 @@ def build_dropped_show_remove_payloads(
     unresolved_keys = set()
     shows: List[Dict[str, Any]] = []
 
-    active_watching_imdb_ids = set()
-    for row in watching_payload.get("watching", []):
-        imdb_id, enriched = resolve_or_skip_imdb(item=row, media_type="show", resolver=resolver)
-        if imdb_id:
-            active_watching_imdb_ids.add(imdb_id)
-            if enriched:
-                stats.enriched += 1
-
-    for row in history_items:
-        if row.get("type") != "show":
-            continue
-
+    for row in watching_payload.get("dropped", []):
         imdb_id, enriched = resolve_or_skip_imdb(item=row, media_type="show", resolver=resolver)
         if not imdb_id:
             unresolved_key = ("show", row.get("title"), row.get("year"), row.get("kinopoisk_id"))
@@ -636,15 +1108,94 @@ def build_dropped_show_remove_payloads(
         if enriched:
             stats.enriched += 1
 
-        if imdb_id in active_watching_imdb_ids:
-            continue
-
         dedup_key = ("show", imdb_id)
         if dedup_key in dedup_keys:
             continue
         dedup_keys.add(dedup_key)
 
         shows.append({"ids": {"imdb": imdb_id}})
+        stats.prepared += 1
+
+    payloads: List[Dict[str, Any]] = []
+    for part in chunked(shows, batch_size):
+        payloads.append({"shows": part})
+    return payloads, stats
+
+
+def build_finished_watching_history_payloads(
+    watching_payload: Dict[str, List[Dict[str, Any]]],
+    *,
+    batch_size: int,
+    resolver: TMDBResolver,
+) -> Tuple[List[Dict[str, Any]], BuildStats]:
+    stats = BuildStats()
+    dedup_keys = set()
+    unresolved_keys = set()
+    shows: List[Dict[str, Any]] = []
+
+    for row in watching_payload.get("watching", []):
+        progress = row.get("progress")
+        if not isinstance(progress, dict):
+            continue
+        if progress.get("is_finished") is not True:
+            continue
+
+        imdb_id, enriched = resolve_or_skip_imdb(item=row, media_type="show", resolver=resolver)
+        if not imdb_id:
+            unresolved_key = ("show", row.get("title"), row.get("year"), row.get("kinopoisk_id"))
+            if unresolved_key not in unresolved_keys:
+                unresolved_keys.add(unresolved_key)
+                stats.skipped += 1
+                logging.warning(
+                    "Skipping finished watching show without resolvable IMDb ID: title=%s year=%s kinopoisk_id=%s",
+                    row.get("title"),
+                    row.get("year"),
+                    row.get("kinopoisk_id"),
+                )
+            continue
+
+        if enriched:
+            stats.enriched += 1
+
+        season = progress.get("last_watched_season")
+        episode = progress.get("last_watched_episode")
+        if not isinstance(season, int) or not isinstance(episode, int) or season <= 0 or episode <= 0:
+            stats.skipped += 1
+            logging.warning(
+                "Skipping finished watching show with invalid season/episode: imdb=%s season=%s episode=%s",
+                imdb_id,
+                season,
+                episode,
+            )
+            continue
+
+        watched_dt = parse_iso_utc(row.get("last_viewed_at"))
+        if watched_dt is None:
+            stats.skipped += 1
+            logging.warning(
+                "Skipping finished watching show with invalid last_viewed_at: imdb=%s last_viewed_at=%s",
+                imdb_id,
+                row.get("last_viewed_at"),
+            )
+            continue
+        watched_at = dt_to_iso_z(watched_dt)
+
+        dedup_key = ("show", imdb_id, season, episode, watched_at)
+        if dedup_key in dedup_keys:
+            continue
+        dedup_keys.add(dedup_key)
+
+        shows.append(
+            {
+                "ids": {"imdb": imdb_id},
+                "seasons": [
+                    {
+                        "number": season,
+                        "episodes": [{"number": episode, "watched_at": watched_at}],
+                    }
+                ],
+            }
+        )
         stats.prepared += 1
 
     payloads: List[Dict[str, Any]] = []
@@ -660,6 +1211,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watching-file", type=Path, default=DEFAULT_WATCHING_FILE)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
     parser.add_argument("--token-cache-file", type=Path, default=DEFAULT_TOKEN_CACHE_FILE)
+    parser.add_argument("--mismatch-approve-cache-file", type=Path, default=DEFAULT_MISMATCH_APPROVE_CACHE_FILE)
 
     parser.add_argument("--trakt-client-id", type=str, default=os.environ.get("TRAKT_CLIENT_ID"))
     parser.add_argument("--trakt-client-secret", type=str, default=os.environ.get("TRAKT_CLIENT_SECRET"))
@@ -671,6 +1223,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-attempts", type=int, default=DEFAULT_RETRY_ATTEMPTS)
     parser.add_argument("--backoff-seconds", type=float, default=DEFAULT_BACKOFF_SECONDS)
     parser.add_argument("--rate-limit-delay", type=float, default=DEFAULT_RATE_LIMIT_DELAY)
+    parser.add_argument(
+        "--mismatch-mode",
+        type=str,
+        default=DEFAULT_MISMATCH_MODE,
+        choices=["off", "approve"],
+    )
+    parser.add_argument("--mismatch-max-gap", type=int, default=DEFAULT_MISMATCH_MAX_GAP)
+    parser.add_argument("--mismatch-approve-cache-clean", action="store_true")
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -828,11 +1388,15 @@ def write_state(
     *,
     dry_run: bool,
     history_stats: BuildStats,
+    finished_watching_stats: BuildStats,
     watchlist_stats: BuildStats,
     dropped_stats: BuildStats,
     history_imported: int,
+    finished_watching_marked: int,
     watchlist_imported: int,
     dropped_hidden: int,
+    mismatch_stats: MismatchStats,
+    mismatch_mode: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -843,6 +1407,12 @@ def write_state(
             "skipped": history_stats.skipped,
             "enriched": history_stats.enriched,
             "imported": history_imported,
+        },
+        "finished_watching": {
+            "prepared": finished_watching_stats.prepared,
+            "skipped": finished_watching_stats.skipped,
+            "enriched": finished_watching_stats.enriched,
+            "marked": finished_watching_marked,
         },
         "watchlist": {
             "prepared": watchlist_stats.prepared,
@@ -855,6 +1425,17 @@ def write_state(
             "skipped": dropped_stats.skipped,
             "enriched": dropped_stats.enriched,
             "hidden": dropped_hidden,
+        },
+        "mismatch": {
+            "mode": mismatch_mode,
+            "heuristic_version": MISMATCH_HEURISTIC_VERSION,
+            "proposals_infer": mismatch_stats.proposals_infer,
+            "proposals_drop": mismatch_stats.proposals_drop,
+            "applied_infer": mismatch_stats.applied_infer,
+            "applied_drop": mismatch_stats.applied_drop,
+            "skipped_unapproved": mismatch_stats.skipped_unapproved,
+            "skipped_rejected": mismatch_stats.skipped_rejected,
+            "unresolved": mismatch_stats.unresolved,
         },
     }
     with path.open("w", encoding="utf-8") as handle:
@@ -878,6 +1459,9 @@ def main() -> int:
     if args.batch_size <= 0:
         logging.error("--batch-size must be greater than 0")
         return 1
+    if args.mismatch_max_gap <= 0:
+        logging.error("--mismatch-max-gap must be greater than 0")
+        return 1
 
     try:
         history_items = load_history(args.history_file)
@@ -900,7 +1484,11 @@ def main() -> int:
         resolver=resolver,
     )
     dropped_remove_payloads, dropped_stats = build_dropped_show_remove_payloads(
-        history_items,
+        watching_payload,
+        batch_size=args.batch_size,
+        resolver=resolver,
+    )
+    finished_watching_payloads, finished_watching_stats = build_finished_watching_history_payloads(
         watching_payload,
         batch_size=args.batch_size,
         resolver=resolver,
@@ -912,6 +1500,13 @@ def main() -> int:
         history_stats.skipped,
         history_stats.enriched,
         len(history_payloads),
+    )
+    logging.info(
+        "Prepared finished-watching marks: %s item(s), skipped=%s, imdb_enriched=%s, batches=%s",
+        finished_watching_stats.prepared,
+        finished_watching_stats.skipped,
+        finished_watching_stats.enriched,
+        len(finished_watching_payloads),
     )
     logging.info(
         "Prepared watchlist import: %s item(s), skipped=%s, imdb_enriched=%s, batches=%s",
@@ -929,19 +1524,25 @@ def main() -> int:
     )
 
     history_imported = 0
+    finished_watching_marked = 0
     watchlist_imported = 0
     dropped_hidden = 0
+    mismatch_stats = MismatchStats()
 
     if args.dry_run:
         write_state(
             args.state_file,
             dry_run=True,
             history_stats=history_stats,
+            finished_watching_stats=finished_watching_stats,
             watchlist_stats=watchlist_stats,
             dropped_stats=dropped_stats,
             history_imported=0,
+            finished_watching_marked=0,
             watchlist_imported=0,
             dropped_hidden=0,
+            mismatch_stats=mismatch_stats,
+            mismatch_mode=args.mismatch_mode,
         )
         logging.info("Dry-run complete. State written to %s", args.state_file)
         return 0
@@ -967,6 +1568,127 @@ def main() -> int:
         expires_at=expires_at,
     )
 
+    if args.mismatch_mode == "approve":
+        if args.mismatch_approve_cache_clean:
+            save_mismatch_approval_cache(args.mismatch_approve_cache_file, {})
+            logging.info("Cleared mismatch approval cache at %s", args.mismatch_approve_cache_file)
+
+        approvals = load_mismatch_approval_cache(args.mismatch_approve_cache_file)
+        proposals, mismatch_stats = build_mismatch_proposals(
+            watching_payload,
+            history_items,
+            resolver=resolver,
+            trakt_client=trakt_client,
+            retries=args.retry_attempts,
+            backoff_seconds=args.backoff_seconds,
+            rate_limit_delay=args.rate_limit_delay,
+            max_gap=args.mismatch_max_gap,
+        )
+
+        finished_items = flatten_payload_items(finished_watching_payloads, "shows")
+        dropped_items = flatten_payload_items(dropped_remove_payloads, "shows")
+
+        for proposal in proposals:
+            decision_payload = approvals.get(proposal.fingerprint)
+            decision = decision_payload.get("decision") if isinstance(decision_payload, dict) else None
+
+            logging.info("Mismatch explanation: %s", explain_mismatch_proposal(proposal))
+
+            logging.info(
+                "Mismatch proposal: action=%s title=%s imdb=%s season=%s source_episode=%s inferred=%s fingerprint=%s decision=%s",
+                proposal.action_type,
+                proposal.title,
+                proposal.imdb_id,
+                proposal.season,
+                proposal.source_episode,
+                proposal.inferred_episodes,
+                proposal.fingerprint,
+                decision if isinstance(decision, str) else "unapproved",
+            )
+
+            decision = resolve_mismatch_proposal_interactive(proposal, decision if isinstance(decision, str) else None)
+            if decision in {"approved", "rejected"}:
+                approvals[proposal.fingerprint] = {
+                    "decision": decision,
+                    "decided_at": dt_to_iso_z(datetime.now(tz=timezone.utc)),
+                    "action_type": proposal.action_type,
+                }
+
+            if decision == "approved":
+                if proposal.action_type == "infer_tail_episodes" and proposal.watched_at:
+                    season_number = proposal.season if isinstance(proposal.season, int) else None
+                    source_episode = proposal.source_episode if isinstance(proposal.source_episode, int) else None
+                    if season_number is None or source_episode is None:
+                        continue
+                    for inferred_episode in proposal.inferred_episodes:
+                        finished_items.append(
+                            {
+                                "ids": {"imdb": proposal.imdb_id},
+                                "seasons": [
+                                    {
+                                        "number": season_number,
+                                        "episodes": [
+                                            {
+                                                "number": inferred_episode,
+                                                "watched_at": proposal.watched_at,
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        )
+                        mismatch_stats.applied_infer += 1
+                elif proposal.action_type in {"drop_finished_no_candidates", "drop_season_count_mismatch"}:
+                    dropped_items.append({"ids": {"imdb": proposal.imdb_id}})
+                    mismatch_stats.applied_drop += 1
+                continue
+
+            if decision == "rejected":
+                mismatch_stats.skipped_rejected += 1
+            else:
+                mismatch_stats.skipped_unapproved += 1
+                mismatch_stats.unresolved += 1
+
+        finished_items = dedupe_show_history_items(finished_items)
+        dropped_items = dedupe_show_id_items(dropped_items)
+        finished_watching_payloads = build_payloads_from_items(finished_items, "shows", args.batch_size)
+        dropped_remove_payloads = build_payloads_from_items(dropped_items, "shows", args.batch_size)
+
+        save_mismatch_approval_cache(args.mismatch_approve_cache_file, approvals)
+
+        logging.info(
+            "Mismatch summary: infer_proposals=%s drop_proposals=%s infer_applied=%s drop_applied=%s skipped_unapproved=%s skipped_rejected=%s unresolved=%s",
+            mismatch_stats.proposals_infer,
+            mismatch_stats.proposals_drop,
+            mismatch_stats.applied_infer,
+            mismatch_stats.applied_drop,
+            mismatch_stats.skipped_unapproved,
+            mismatch_stats.skipped_rejected,
+            mismatch_stats.unresolved,
+        )
+
+        if mismatch_stats.unresolved > 0:
+            logging.error(
+                "Found %s unresolved mismatch proposal(s). Aborting before any Trakt sync.",
+                mismatch_stats.unresolved,
+            )
+            write_state(
+                args.state_file,
+                dry_run=False,
+                history_stats=history_stats,
+                finished_watching_stats=finished_watching_stats,
+                watchlist_stats=watchlist_stats,
+                dropped_stats=dropped_stats,
+                history_imported=0,
+                finished_watching_marked=0,
+                watchlist_imported=0,
+                dropped_hidden=0,
+                mismatch_stats=mismatch_stats,
+                mismatch_mode=args.mismatch_mode,
+            )
+            logging.info("State written to %s", args.state_file)
+            return 1
+
     try:
         logging.info("Starting Trakt sync/history import (%s batch(es))", len(history_payloads))
         for index, payload in enumerate(history_payloads, start=1):
@@ -981,6 +1703,25 @@ def main() -> int:
             )
             added = extract_added_count(response)
             history_imported += added if added else sum(len(v) for v in payload.values() if isinstance(v, list))
+
+        logging.info("Starting Trakt sync/history finished-watching marks (%s batch(es))", len(finished_watching_payloads))
+        for index, payload in enumerate(finished_watching_payloads, start=1):
+            batch_items = sum(len(v) for v in payload.values() if isinstance(v, list))
+            logging.info(
+                "Posting sync/history finished-watching batch %s/%s (%s item(s))",
+                index,
+                len(finished_watching_payloads),
+                batch_items,
+            )
+            response = trakt_client.post_with_retry(
+                "sync/history",
+                payload,
+                retries=args.retry_attempts,
+                backoff_seconds=args.backoff_seconds,
+                rate_limit_delay=args.rate_limit_delay,
+            )
+            added = extract_added_count(response)
+            finished_watching_marked += added if added else sum(len(v) for v in payload.values() if isinstance(v, list))
 
         logging.info("Starting Trakt sync/watchlist import (%s batch(es))", len(watchlist_payloads))
         for index, payload in enumerate(watchlist_payloads, start=1):
@@ -1025,15 +1766,20 @@ def main() -> int:
         args.state_file,
         dry_run=False,
         history_stats=history_stats,
+        finished_watching_stats=finished_watching_stats,
         watchlist_stats=watchlist_stats,
         dropped_stats=dropped_stats,
         history_imported=history_imported,
+        finished_watching_marked=finished_watching_marked,
         watchlist_imported=watchlist_imported,
         dropped_hidden=dropped_hidden,
+        mismatch_stats=mismatch_stats,
+        mismatch_mode=args.mismatch_mode,
     )
 
     logging.info("Trakt import completed successfully.")
     logging.info("Imported history events: %s", history_imported)
+    logging.info("Marked finished watching shows as watched: %s", finished_watching_marked)
     logging.info("Imported watchlist items: %s", watchlist_imported)
     logging.info("Hidden dropped shows in Trakt: %s", dropped_hidden)
     logging.info("State written to %s", args.state_file)

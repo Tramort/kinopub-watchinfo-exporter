@@ -154,8 +154,9 @@ Implemented in `traktv-importer.py`.
 
 Scope:
 - Imports `data/history.json` to Trakt `sync/history`.
+- Marks `data/watching.json` `watching[]` items with `progress.is_finished == true` as watched in Trakt `sync/history`.
 - Imports `data/watchlist.json` to Trakt `sync/watchlist`.
-- Derives dropped-show candidates from `data/history.json` shows minus active `data/watching.json` `watching[]` and sends them to Trakt hidden dropped (`users/hidden/dropped`).
+- Uses `data/watching.json` `dropped[]` as dropped-show candidates and sends them to Trakt hidden dropped (`users/hidden/dropped`).
 - Authentication for live import uses cached tokens with refresh and falls back to Trakt OAuth Device Code Flow.
 
 Field mapping:
@@ -163,12 +164,14 @@ Field mapping:
 - `history[].watched_at` -> `watched_at` (UTC ISO-8601 with `Z`).
 - `history[].type == "movie"` -> Trakt movie history entries.
 - `history[].type == "show"` with `season` and `episode` -> Trakt show/season/episode history entries.
+- `watching.watching[]` with `progress.is_finished == true` -> Trakt show history entry using `last_watched_season`, `last_watched_episode`, and `last_viewed_at`.
 - `watchlist.movies[]` and `watchlist.shows[]` -> Trakt watchlist movie/show entries.
-- History show IMDb IDs not present in `watching.watching[]` (or TMDB-resolved IMDb) -> Trakt `users/hidden/dropped` show entries.
+- `watching.dropped[]` show IMDb IDs (or TMDB-resolved IMDb) -> Trakt `users/hidden/dropped` show entries.
 
 Identifier policy:
 - Primary identifier is IMDb ID.
 - If IMDb is missing/invalid, importer attempts TMDB title/year lookup (when `TMDB_API_KEY` is provided) and then uses external IMDb ID.
+- TMDB year lookup tries the provided year first, then `year-1` and `year+1`.
 - Items unresolved to IMDb are skipped with warnings.
 
 3D compatibility:
@@ -181,7 +184,32 @@ Resilience and idempotency:
 - Rate-limit (429) is respected via retry-after handling.
 - Sync summary is written to `data/trakt_sync_state.json`.
 
+Mismatch resolver and approvals:
+- Importer supports `--mismatch-mode off|approve` (default `approve`).
+- In `approve` mode, importer inspects finished shows (`watching[].progress.is_finished == true`) and fetches Trakt season episode lists.
+- For each finished show, importer checks seasons `1..last_watched_season` (season 0 is excluded). Earlier seasons use max watched episode from `history.json`; the final season uses `last_watched_episode`.
+- If KinoPub `last_watched_season` differs from Trakt's highest season number, importer creates a `drop_season_count_mismatch` proposal.
+- It creates `infer_tail_episodes` proposals when Trakt has a contiguous tail beyond KinoPub's final episode for that season and the gap is within `--mismatch-max-gap` (default 1).
+- If no inference candidate exists for a finished show, importer creates a `drop_finished_no_candidates` proposal.
+- Importer logs a mismatch explanation before each proposal.
+- Unresolved proposals are resolved interactively with options `approve|reject|defer`; default answer is proposal approval.
+- Proposals are applied only when exact fingerprints are approved in `data/trakt_mismatch_approvals.json`.
+- `--mismatch-approve-cache-clean` clears approval cache before the run.
+- If any proposal remains unresolved, importer aborts before any Trakt sync calls.
+- If KinoPub last watched episode equals Trakt season max episode, it is not a mismatch and no proposal is created.
+- If KinoPub last watched episode is greater than Trakt season max episode, it is treated as already aligned and no proposal is created.
+- Season 0 is never inferred.
+
 Device flow behavior:
 - Script first tries cached Trakt token from `data/trakt_token_cache.json` (or `--token-cache-file`).
 - If access token is expired, script attempts refresh via `/oauth/token`.
 - If cache/refresh cannot be used, script requests a device code from `/oauth/device/code` and polls `/oauth/device/token`.
+
+
+# Observed issues
+- some shows kinopub and trakt have different season/episode numbering; this can cause history sync mismatches.
+  for example Star Wars Rebels season 4 episode 15:
+  - On traktv it's two episodes (15 and 16), 24 minutes each
+  - But kinopub has this episodes as one big episode 45 minutes
+  Fixed with Mismatch resolver.
+
