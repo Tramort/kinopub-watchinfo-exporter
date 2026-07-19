@@ -18,8 +18,11 @@ Primary run command:
 Useful variants:
 - python kinopub-exporter.py --full
 - python kinopub-exporter.py --since 2026-07-05T12:00:00Z
+- python kinopub-exporter.py --cache
 - python kinopub-exporter.py --history-file data/history.json
 - python kinopub-exporter.py --base-url https://api.service-kp.com
+- python traktv-importer.py --dry-run
+- python trakt-sonarr-nextup.py --dry-run
 
 Notes:
 - There is currently no test suite or lint configuration in this repository.
@@ -29,6 +32,8 @@ Notes:
 
 Main implementation:
 - [kinopub-exporter.py](kinopub-exporter.py): API client, pagination, filtering, incremental/full sync, JSON output.
+- [traktv-importer.py](traktv-importer.py): import exported watch data into Trakt.tv.
+- [trakt-sonarr-nextup.py](trakt-sonarr-nextup.py): sync Trakt in-progress shows to a custom list for Sonarr.
 
 Not part of exporter flow:
 - [main.py](main.py): placeholder script.
@@ -37,6 +42,7 @@ Generated outputs:
 - [data/history.json](data/history.json)
 - [data/watchlist.json](data/watchlist.json)
 - [data/watching.json](data/watching.json)
+- [data/trakt_sonarr_nextup_state.json](data/trakt_sonarr_nextup_state.json)
 
 ## Project Conventions
 
@@ -60,7 +66,7 @@ Filtering and deduplication:
 Reliability and API behavior:
 - Keep retry + backoff semantics.
 - Keep API version detection and prefix fallback logic.
-- Keep requests-cache and Last-Modified handling unless changing cache strategy intentionally.
+- HTTP responses are always written to requests-cache; read from cache only when `--cache` is set. Without `--cache`, requests use force_refresh (fresh network data).
 
 ## Edit Guidance For Agents
 

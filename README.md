@@ -21,6 +21,7 @@ Run:
 Useful flags:
 - `--full`
 - `--since 2026-07-05T12:00:00Z`
+- `--cache` (read HTTP responses from local cache when available; without this flag, requests are always fresh and still written to the cache)
 - `--history-file data/history.json`
 - `--base-url https://api.service-kp.com`
 - `--raw-dump` (writes one raw successful API JSON response per file into `data/kinopub_raw_dumps/`)
@@ -48,6 +49,7 @@ Useful flags:
 - `--mismatch-mode off|approve` (default: `approve`)
 - `--mismatch-approve-cache-file data/trakt_mismatch_approvals.json`
 - `--mismatch-approve-cache-clean` (clear approval cache before run)
+- `--mismatch-auto-approve` (approve unresolved proposals without prompts)
 - `--mismatch-max-gap 1`
 - `--device-auth-timeout 900`
 - `--batch-size 100`
@@ -65,7 +67,32 @@ Notes:
 - If KinoPub last watched episode equals or exceeds Trakt season max episode, no mismatch proposal is created.
 - Before each proposal, importer logs a human-readable mismatch explanation.
 - For unresolved proposals, importer asks an interactive question with options `approve|reject|defer`; default is `approve`.
+- With `--mismatch-auto-approve`, unresolved proposals are approved automatically (cached rejections are still respected).
 - Proposals are persisted in `data/trakt_mismatch_approvals.json` with exact fingerprint decisions.
 - If any proposal remains unresolved (`defer` or no interactive input), importer aborts before sending any data to Trakt.
 - KinoPub `is_3d` metadata is imported as standard Trakt movie history items.
 - For live imports, the script uses cached Trakt tokens when possible and falls back to Device Code Flow when needed.
+
+## Sonarr Next-Up List (Trakt workaround)
+
+Sonarr's **User Watched → In Progress** import list breaks after Trakt's 2026 watched API change (`seasons` omitted unless `extended=progress`). Use this script to sync in-progress shows into a custom Trakt list that Sonarr can import.
+
+Shows hidden as dropped on Trakt (`users/hidden/dropped`) are excluded from the list.
+
+Run:
+- `python trakt-sonarr-nextup.py --dry-run`
+- `python trakt-sonarr-nextup.py`
+
+Useful flags:
+- `--list-name "Sonarr Next Up"`
+- `--list-slug sonarr-next-up`
+- `--token-cache-file data/trakt_token_cache.json`
+- `--state-file data/trakt_sonarr_nextup_state.json`
+- `--page-size 100`
+- `--batch-size 100`
+
+Sonarr setup:
+1. Run the script once (creates private list `sonarr-next-up` if missing).
+2. In Sonarr: **Settings → Import Lists → Trakt List**.
+3. Authenticate with Trakt, set your Trakt username, list name/slug `sonarr-next-up`.
+4. Re-run the script periodically (cron) after history changes.

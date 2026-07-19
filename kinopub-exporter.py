@@ -19,7 +19,6 @@ TOKEN = os.environ.get("KINOPUB_TOKEN", TOKEN_PLACEHOLDER)
 USER_AGENT = "KinoPubWatchInfoExporter/1.0"
 
 CACHE_DB_FILE = Path(".kinopub_http_cache")
-CACHE_TTL_HOURS = 1
 OUTPUT_DIR = Path("data")
 WATCHLIST_OUTPUT_FILE = OUTPUT_DIR / "watchlist.json"
 WATCHING_OUTPUT_FILE = OUTPUT_DIR / "watching.json"
@@ -276,6 +275,7 @@ class KinoPubClient:
         prefixes: Optional[List[str]] = None,
         raw_dump_enabled: bool = False,
         raw_dump_dir: Optional[Path] = None,
+        use_cache: bool = False,
     ) -> None:
         base_prefixes = prefixes or ["/v1", "/v2"]
         self.base_url, self.prefixes = split_base_url_and_prefixes(base_url, base_prefixes)
@@ -287,11 +287,12 @@ class KinoPubClient:
         self.raw_dump_enabled = raw_dump_enabled
         self.raw_dump_dir = Path(raw_dump_dir) if raw_dump_dir is not None else RAW_DUMP_OUTPUT_DIR
         self.raw_dump_count = 0
+        self.use_cache = use_cache
         self.session = requests_cache.CachedSession(
             cache_name=str(CACHE_DB_FILE),
             backend="sqlite",
-            #expire_after=timedelta(hours=CACHE_TTL_HOURS),
-            always_revalidate=True,
+            expire_after=requests_cache.NEVER_EXPIRE,
+            always_revalidate=False,
             allowable_methods=("GET",),
         )
         self.preferred_prefix = self.detect_api_prefix()
@@ -335,6 +336,7 @@ class KinoPubClient:
                     headers=self.headers,
                     params=params,
                     timeout=REQUEST_TIMEOUT_SECONDS,
+                    force_refresh=not self.use_cache,
                 )
 
                 if response.status_code == 401:
@@ -355,6 +357,7 @@ class KinoPubClient:
                             "endpoint": endpoint,
                             "params": params,
                             "status_code": response.status_code,
+                            "headers": dict(response.headers),
                             "from_cache": bool(getattr(response, "from_cache", False)),
                             "payload": payload,
                         }
@@ -518,17 +521,18 @@ def get_watching(
 ) -> Dict[str, List[Dict[str, Any]]]:
     logging.info("Exporting watching shows from history payload...")
     latest_by_show: Dict[Tuple[str, Any], Dict[str, Any]] = {}
-    finished_by_kinopub_id: Dict[int, Optional[bool]] = {}
+    # True when every non-special season on /watching has status == 1 (user caught up).
+    caught_up_by_kinopub_id: Dict[int, Optional[bool]] = {}
 
-    def extract_finished_from_watching_details(kinopub_id: int) -> Optional[bool]:
-        if kinopub_id in finished_by_kinopub_id:
-            return finished_by_kinopub_id[kinopub_id]
+    def extract_caught_up_from_watching_details(kinopub_id: int) -> Optional[bool]:
+        if kinopub_id in caught_up_by_kinopub_id:
+            return caught_up_by_kinopub_id[kinopub_id]
 
         details = client.request("/watching", params={"id": kinopub_id})
         detail_item = details.get("item") if isinstance(details, dict) else None
         seasons = detail_item.get("seasons") if isinstance(detail_item, dict) else None
         if not isinstance(seasons, list) or not seasons:
-            finished_by_kinopub_id[kinopub_id] = None
+            caught_up_by_kinopub_id[kinopub_id] = None
             return None
 
         season_statuses: List[int] = []
@@ -545,12 +549,12 @@ def get_watching(
             season_statuses.append(status)
 
         if not season_statuses:
-            finished_by_kinopub_id[kinopub_id] = None
+            caught_up_by_kinopub_id[kinopub_id] = None
             return None
 
-        is_finished = all(status == 1 for status in season_statuses)
-        finished_by_kinopub_id[kinopub_id] = is_finished
-        return is_finished
+        caught_up = all(status == 1 for status in season_statuses)
+        caught_up_by_kinopub_id[kinopub_id] = caught_up
+        return caught_up
 
     for history_item in history_items:
         if not isinstance(history_item, dict):
@@ -587,12 +591,19 @@ def get_watching(
         last_viewed_at = watched_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         is_subscribed_raw = item_meta.get("subscribed")
         is_subscribed = bool(is_subscribed_raw) if is_subscribed_raw is not None else True
-        fallback_finished = bool(item_meta.get("finished"))
+        # KinoPub item.finished means the show has ended (no further seasons expected),
+        # not merely that the user caught up on currently available episodes.
+        show_ended = bool(item_meta.get("finished"))
 
-        finished_from_watching: Optional[bool] = None
+        caught_up: Optional[bool] = None
         if kinopub_id is not None:
-            finished_from_watching = extract_finished_from_watching_details(kinopub_id)
-        is_finished = finished_from_watching if finished_from_watching is not None else fallback_finished
+            caught_up = extract_caught_up_from_watching_details(kinopub_id)
+        # Finished = ended show AND user completed all available seasons.
+        # Caught-up ongoing shows (e.g. Rick and Morty) stay is_finished=false.
+        if caught_up is not None:
+            is_finished = show_ended and caught_up
+        else:
+            is_finished = show_ended
 
         if kinopub_id is not None:
             show_key: Tuple[str, Any] = ("kinopub_id", kinopub_id)
@@ -817,6 +828,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Write each successful API JSON response into a separate file in a dump directory. Optionally pass a custom directory path.",
     )
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="Read HTTP responses from the local cache when available. Without this flag, requests are always fetched fresh (and still written to the cache).",
+    )
     return parser.parse_args()
 
 
@@ -863,8 +879,12 @@ def main() -> int:
         prefixes=prefixes,
         raw_dump_enabled=bool(args.raw_dump),
         raw_dump_dir=args.raw_dump,
+        use_cache=args.cache,
     )
-    logging.info("HTTP cache enabled: %s (TTL=%sh fallback)", CACHE_DB_FILE, CACHE_TTL_HOURS)
+    if args.cache:
+        logging.info("HTTP cache read enabled: %s (misses still fetch and store)", CACHE_DB_FILE)
+    else:
+        logging.info("HTTP cache write-only: %s (fresh requests, responses stored)", CACHE_DB_FILE)
 
     try:
         watchlist = get_watchlist(client, since_dt=since_dt, full_export=args.full)

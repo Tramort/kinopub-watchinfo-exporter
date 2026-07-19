@@ -735,9 +735,22 @@ def explain_mismatch_proposal(proposal: MismatchProposal) -> str:
     )
 
 
-def resolve_mismatch_proposal_interactive(proposal: MismatchProposal, current_decision: Optional[str]) -> Optional[str]:
+def resolve_mismatch_proposal(
+    proposal: MismatchProposal,
+    current_decision: Optional[str],
+    *,
+    auto_approve: bool = False,
+) -> Optional[str]:
     if current_decision in {"approved", "rejected"}:
         return current_decision
+
+    if auto_approve:
+        logging.info(
+            "Auto-approving proposal for %s [%s]",
+            proposal.title,
+            proposal.fingerprint,
+        )
+        return "approved"
 
     if not sys.stdin.isatty():
         logging.warning(
@@ -1231,6 +1244,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mismatch-max-gap", type=int, default=DEFAULT_MISMATCH_MAX_GAP)
     parser.add_argument("--mismatch-approve-cache-clean", action="store_true")
+    parser.add_argument(
+        "--mismatch-auto-approve",
+        action="store_true",
+        help="Approve all unresolved mismatch proposals without interactive prompts.",
+    )
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -1606,7 +1624,11 @@ def main() -> int:
                 decision if isinstance(decision, str) else "unapproved",
             )
 
-            decision = resolve_mismatch_proposal_interactive(proposal, decision if isinstance(decision, str) else None)
+            decision = resolve_mismatch_proposal(
+                proposal,
+                decision if isinstance(decision, str) else None,
+                auto_approve=args.mismatch_auto_approve,
+            )
             if decision in {"approved", "rejected"}:
                 approvals[proposal.fingerprint] = {
                     "decision": decision,

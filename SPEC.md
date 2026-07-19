@@ -124,14 +124,16 @@ Sync Modes:
 ## Implementation Notes
 
 - kinopub history api uses pagination; implement automatic pagination handling
-- cache raw API responses to avoid redundant requests and reduce load on the API (requests-cache)
+- cache raw API responses with requests-cache; always store fresh responses, and read from cache only when `--cache` is set
 - Error Handling:
   - Skip unsupported types (log warnings)
   - Retry failed API calls (3 attempts with backoff)
   - Validate IMDb IDs before export; if IMDb is missing/invalid but Kinopoisk ID exists, keep the item with `imdb_id: null`
   - Keep items even when both IMDb and Kinopoisk IDs are missing; warn if required metadata (`original_title`, `year`) is missing
-- The is_finished Marker: Tracking whether a show is fully completed helps platforms like Simkl automatically archive
-  it, preventing your active "Watching" list from getting cluttered with dead weight.
+- The is_finished Marker: `true` only when KinoPub marks the show as ended (`item.finished`) *and* every
+  non-special season on `/watching` has `status == 1` (user caught up). Catching up on an ongoing series
+  (e.g. Rick and Morty) must stay `is_finished: false`. This helps platforms like Simkl archive completed shows
+  without treating "caught up, waiting for next season" as finished.
 - Multi-part Movie DuplicatesMovies split into multiple video files on Kino.pub register as multiple full views in your
   history log. They require deduplication within a 24-hour window.
 - Bonus Material Pollution: Clicking on short clips, trailers, or "making-of" videos registers as a full movie watch
@@ -193,6 +195,7 @@ Mismatch resolver and approvals:
 - If no inference candidate exists for a finished show, importer creates a `drop_finished_no_candidates` proposal.
 - Importer logs a mismatch explanation before each proposal.
 - Unresolved proposals are resolved interactively with options `approve|reject|defer`; default answer is proposal approval.
+- `--mismatch-auto-approve` auto-approves unresolved proposals without interactive prompts; cached rejections are still respected.
 - Proposals are applied only when exact fingerprints are approved in `data/trakt_mismatch_approvals.json`.
 - `--mismatch-approve-cache-clean` clears approval cache before the run.
 - If any proposal remains unresolved, importer aborts before any Trakt sync calls.
