@@ -25,6 +25,7 @@ Useful variants:
 - python trakt-sonarr-nextup.py --dry-run
 
 Docker:
+- Published image: `ghcr.io/tramort/kinopub-watchinfo-exporter` (`latest`, semver tags, SHA).
 - docker build -t kinopub-watchinfo-exporter .
 - docker run --rm --env-file .env -v "$PWD/data:/app/data" kinopub-watchinfo-exporter kinopub-exporter.py
 - Periodic: set `CRON_SCHEDULE` (e.g. `0 */6 * * *`) — same image, any script as the command.
@@ -33,6 +34,7 @@ Docker:
 
 Notes:
 - There is currently no test suite or lint configuration in this repository.
+- CI: `.github/workflows/docker.yml` builds (PRs) and publishes multi-arch images to GHCR (main / `v*` tags).
 - Validate behavior by running the exporter and checking generated JSON files.
 
 ## Code Map
@@ -43,6 +45,7 @@ Main implementation:
 - [trakt-sonarr-nextup.py](trakt-sonarr-nextup.py): sync Trakt in-progress shows to a custom list for Sonarr.
 - [Dockerfile](Dockerfile) / [docker-entrypoint.sh](docker-entrypoint.sh): image entrypoint; one-shot or `CRON_SCHEDULE` via supercronic.
 - [docker-compose.yml](docker-compose.yml): example scheduled services.
+- [.github/workflows/docker.yml](.github/workflows/docker.yml): build/push multi-arch image to GHCR.
 
 Not part of exporter flow:
 - [main.py](main.py): placeholder script.

@@ -101,7 +101,15 @@ Sonarr setup:
 
 One image runs any project script once, or on a schedule when `CRON_SCHEDULE` is set (via [supercronic](https://github.com/aptible/supercronic)).
 
-Build:
+Published images (linux/amd64, linux/arm64) are on GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/tramort/kinopub-watchinfo-exporter:latest
+```
+
+Tags: `latest` (main), `vX.Y.Z` / `vX.Y` (release tags), and `sha-<commit>`.
+
+Build locally:
 
 ```bash
 docker build -t kinopub-watchinfo-exporter .
@@ -111,7 +119,7 @@ One-shot (mount `data/` and pass secrets via `.env`):
 
 ```bash
 docker run --rm --env-file .env -v "$PWD/data:/app/data" \
-  kinopub-watchinfo-exporter kinopub-exporter.py
+  ghcr.io/tramort/kinopub-watchinfo-exporter:latest kinopub-exporter.py
 ```
 
 Periodic:
@@ -119,14 +127,14 @@ Periodic:
 ```bash
 docker run --rm --env-file .env -e CRON_SCHEDULE="0 */6 * * *" \
   -v "$PWD/data:/app/data" \
-  kinopub-watchinfo-exporter kinopub-exporter.py
+  ghcr.io/tramort/kinopub-watchinfo-exporter:latest kinopub-exporter.py
 ```
 
 Any other script (extra CLI flags are passed through):
 
 ```bash
 docker run --rm --env-file .env -v "$PWD/data:/app/data" \
-  kinopub-watchinfo-exporter trakt-sonarr-nextup.py --dry-run
+  ghcr.io/tramort/kinopub-watchinfo-exporter:latest trakt-sonarr-nextup.py --dry-run
 ```
 
 Compose example (exporter → importer → sonarr-nextup on staggered 6h schedules):
@@ -135,7 +143,16 @@ Compose example (exporter → importer → sonarr-nextup on staggered 6h schedul
 docker compose up -d --build
 ```
 
+To use the published image instead of building, set in `docker-compose.yml`:
+
+```yaml
+image: ghcr.io/tramort/kinopub-watchinfo-exporter:latest
+```
+
+and drop `build: .` (or keep both — compose will pull/build as needed).
+
 Notes:
 - Persist JSON and token cache with `-v "$PWD/data:/app/data"`.
 - Credentials come from `.env` (`KINOPUB_TOKEN`, `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, optional `TMDB_API_KEY`).
 - Scheduled `traktv-importer.py` must use `--mismatch-auto-approve` (non-interactive); `docker-compose.yml` already sets this.
+- CI builds the image on PRs; pushes to `ghcr.io` on `main` and `v*` tags. If the package is private, make it public under the repo’s Packages settings (or `docker login ghcr.io` to pull).
