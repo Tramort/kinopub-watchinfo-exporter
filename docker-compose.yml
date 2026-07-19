@@ -1,7 +1,7 @@
 services:
   exporter:
     build: .
-    image: kinopub-watchinfo-exporter
+    image: ghcr.io/tramort/kinopub-watchinfo-exporter:latest
     env_file: .env
     environment:
       CRON_SCHEDULE: "0 */6 * * *"
@@ -11,7 +11,7 @@ services:
     restart: unless-stopped
 
   importer:
-    image: kinopub-watchinfo-exporter
+    image: ghcr.io/tramort/kinopub-watchinfo-exporter:latest
     depends_on:
       - exporter
     env_file: .env
@@ -23,8 +23,9 @@ services:
     command: ["traktv-importer.py", "--mismatch-auto-approve"]
     restart: unless-stopped
 
-  sonarr-nextup:
-    image: kinopub-watchinfo-exporter
+  nextup:
+    container_name: traktv-nextup
+    image: ghcr.io/tramort/kinopub-watchinfo-exporter:latest
     depends_on:
       - importer
     env_file: .env
@@ -32,5 +33,5 @@ services:
       CRON_SCHEDULE: "30 */6 * * *"
     volumes:
       - ./data:/app/data
-    command: ["trakt-sonarr-nextup.py"]
+    command: ["trakt-nextup.py"]
     restart: unless-stopped

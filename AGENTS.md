@@ -22,12 +22,12 @@ Useful variants:
 - python kinopub-exporter.py --history-file data/history.json
 - python kinopub-exporter.py --base-url https://api.service-kp.com
 - python traktv-importer.py --dry-run
-- python trakt-sonarr-nextup.py --dry-run
+- python trakt-nextup.py --dry-run
 
 Docker:
 - Published image: `ghcr.io/tramort/kinopub-watchinfo-exporter` (`latest`, semver tags, SHA).
-- docker build -t kinopub-watchinfo-exporter .
-- docker run --rm --env-file .env -v "$PWD/data:/app/data" kinopub-watchinfo-exporter kinopub-exporter.py
+- docker build -t ghcr.io/tramort/kinopub-watchinfo-exporter:latest .
+- docker run --rm --env-file .env -v "$PWD/data:/app/data" ghcr.io/tramort/kinopub-watchinfo-exporter:latest kinopub-exporter.py
 - Periodic: set `CRON_SCHEDULE` (e.g. `0 */6 * * *`) — same image, any script as the command.
 - docker compose up -d --build
 - Scheduled `traktv-importer.py` needs `--mismatch-auto-approve` (no interactive prompts).
@@ -42,7 +42,7 @@ Notes:
 Main implementation:
 - [kinopub-exporter.py](kinopub-exporter.py): API client, pagination, filtering, incremental/full sync, JSON output.
 - [traktv-importer.py](traktv-importer.py): import exported watch data into Trakt.tv.
-- [trakt-sonarr-nextup.py](trakt-sonarr-nextup.py): sync Trakt in-progress shows to a custom list for Sonarr.
+- [trakt-nextup.py](trakt-nextup.py): sync Trakt in-progress shows to a custom list for Sonarr.
 - [Dockerfile](Dockerfile) / [docker-entrypoint.sh](docker-entrypoint.sh): image entrypoint; one-shot or `CRON_SCHEDULE` via supercronic.
 - [docker-compose.yml](docker-compose.yml): example scheduled services.
 - [.github/workflows/docker.yml](.github/workflows/docker.yml): build/push multi-arch image to GHCR.
@@ -54,7 +54,7 @@ Generated outputs:
 - [data/history.json](data/history.json)
 - [data/watchlist.json](data/watchlist.json)
 - [data/watching.json](data/watching.json)
-- [data/trakt_sonarr_nextup_state.json](data/trakt_sonarr_nextup_state.json)
+- [data/trakt_nextup_state.json](data/trakt_nextup_state.json)
 
 ## Project Conventions
 

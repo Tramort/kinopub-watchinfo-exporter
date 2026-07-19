@@ -6,7 +6,7 @@ if [ "$#" -lt 1 ]; then
   echo "Examples:" >&2
   echo "  kinopub-exporter.py" >&2
   echo "  traktv-importer.py --mismatch-auto-approve" >&2
-  echo "  trakt-sonarr-nextup.py --dry-run" >&2
+  echo "  trakt-nextup.py --dry-run" >&2
   echo "Set CRON_SCHEDULE to run periodically (e.g. '0 */6 * * *')." >&2
   exit 1
 fi

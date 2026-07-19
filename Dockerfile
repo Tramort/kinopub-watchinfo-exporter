@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir uv \
  && uv sync --frozen --no-dev --no-install-project \
  && pip uninstall -y uv
 
-COPY kinopub-exporter.py traktv-importer.py trakt-sonarr-nextup.py docker-entrypoint.sh ./
+COPY kinopub-exporter.py traktv-importer.py trakt-nextup.py docker-entrypoint.sh ./
 RUN chmod +x /app/docker-entrypoint.sh \
  && mkdir -p /app/data
 

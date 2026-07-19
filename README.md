@@ -80,14 +80,14 @@ Sonarr's **User Watched → In Progress** import list breaks after Trakt's 2026 
 Shows hidden as dropped on Trakt (`users/hidden/dropped`) are excluded from the list.
 
 Run:
-- `python trakt-sonarr-nextup.py --dry-run`
-- `python trakt-sonarr-nextup.py`
+- `python trakt-nextup.py --dry-run`
+- `python trakt-nextup.py`
 
 Useful flags:
 - `--list-name "Sonarr Next Up"`
 - `--list-slug sonarr-next-up`
 - `--token-cache-file data/trakt_token_cache.json`
-- `--state-file data/trakt_sonarr_nextup_state.json`
+- `--state-file data/trakt_nextup_state.json`
 - `--page-size 100`
 - `--batch-size 100`
 
@@ -134,22 +134,16 @@ Any other script (extra CLI flags are passed through):
 
 ```bash
 docker run --rm --env-file .env -v "$PWD/data:/app/data" \
-  ghcr.io/tramort/kinopub-watchinfo-exporter:latest trakt-sonarr-nextup.py --dry-run
+  ghcr.io/tramort/kinopub-watchinfo-exporter:latest trakt-nextup.py --dry-run
 ```
 
-Compose example (exporter → importer → sonarr-nextup on staggered 6h schedules):
+Compose example (exporter → importer → nextup on staggered 6h schedules):
 
 ```bash
 docker compose up -d --build
 ```
 
-To use the published image instead of building, set in `docker-compose.yml`:
-
-```yaml
-image: ghcr.io/tramort/kinopub-watchinfo-exporter:latest
-```
-
-and drop `build: .` (or keep both — compose will pull/build as needed).
+`docker-compose.yml` uses `ghcr.io/tramort/kinopub-watchinfo-exporter:latest`. With `build: .` on the exporter service, `compose up --build` rebuilds and tags that image locally; omit `build` to pull only.
 
 Notes:
 - Persist JSON and token cache with `-v "$PWD/data:/app/data"`.
