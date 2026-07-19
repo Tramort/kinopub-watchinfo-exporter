@@ -96,3 +96,46 @@ Sonarr setup:
 2. In Sonarr: **Settings → Import Lists → Trakt List**.
 3. Authenticate with Trakt, set your Trakt username, list name/slug `sonarr-next-up`.
 4. Re-run the script periodically (cron) after history changes.
+
+## Docker
+
+One image runs any project script once, or on a schedule when `CRON_SCHEDULE` is set (via [supercronic](https://github.com/aptible/supercronic)).
+
+Build:
+
+```bash
+docker build -t kinopub-watchinfo-exporter .
+```
+
+One-shot (mount `data/` and pass secrets via `.env`):
+
+```bash
+docker run --rm --env-file .env -v "$PWD/data:/app/data" \
+  kinopub-watchinfo-exporter kinopub-exporter.py
+```
+
+Periodic:
+
+```bash
+docker run --rm --env-file .env -e CRON_SCHEDULE="0 */6 * * *" \
+  -v "$PWD/data:/app/data" \
+  kinopub-watchinfo-exporter kinopub-exporter.py
+```
+
+Any other script (extra CLI flags are passed through):
+
+```bash
+docker run --rm --env-file .env -v "$PWD/data:/app/data" \
+  kinopub-watchinfo-exporter trakt-sonarr-nextup.py --dry-run
+```
+
+Compose example (exporter → importer → sonarr-nextup on staggered 6h schedules):
+
+```bash
+docker compose up -d --build
+```
+
+Notes:
+- Persist JSON and token cache with `-v "$PWD/data:/app/data"`.
+- Credentials come from `.env` (`KINOPUB_TOKEN`, `TRAKT_CLIENT_ID`, `TRAKT_CLIENT_SECRET`, optional `TMDB_API_KEY`).
+- Scheduled `traktv-importer.py` must use `--mismatch-auto-approve` (non-interactive); `docker-compose.yml` already sets this.

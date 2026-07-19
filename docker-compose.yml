@@ -1,0 +1,36 @@
+services:
+  exporter:
+    build: .
+    image: kinopub-watchinfo-exporter
+    env_file: .env
+    environment:
+      CRON_SCHEDULE: "0 */6 * * *"
+    volumes:
+      - ./data:/app/data
+    command: ["kinopub-exporter.py"]
+    restart: unless-stopped
+
+  importer:
+    image: kinopub-watchinfo-exporter
+    depends_on:
+      - exporter
+    env_file: .env
+    environment:
+      CRON_SCHEDULE: "15 */6 * * *"
+    volumes:
+      - ./data:/app/data
+    # Non-interactive mode required for scheduled runs.
+    command: ["traktv-importer.py", "--mismatch-auto-approve"]
+    restart: unless-stopped
+
+  sonarr-nextup:
+    image: kinopub-watchinfo-exporter
+    depends_on:
+      - importer
+    env_file: .env
+    environment:
+      CRON_SCHEDULE: "30 */6 * * *"
+    volumes:
+      - ./data:/app/data
+    command: ["trakt-sonarr-nextup.py"]
+    restart: unless-stopped

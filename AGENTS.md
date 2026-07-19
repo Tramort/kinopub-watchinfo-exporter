@@ -24,6 +24,13 @@ Useful variants:
 - python traktv-importer.py --dry-run
 - python trakt-sonarr-nextup.py --dry-run
 
+Docker:
+- docker build -t kinopub-watchinfo-exporter .
+- docker run --rm --env-file .env -v "$PWD/data:/app/data" kinopub-watchinfo-exporter kinopub-exporter.py
+- Periodic: set `CRON_SCHEDULE` (e.g. `0 */6 * * *`) — same image, any script as the command.
+- docker compose up -d --build
+- Scheduled `traktv-importer.py` needs `--mismatch-auto-approve` (no interactive prompts).
+
 Notes:
 - There is currently no test suite or lint configuration in this repository.
 - Validate behavior by running the exporter and checking generated JSON files.
@@ -34,6 +41,8 @@ Main implementation:
 - [kinopub-exporter.py](kinopub-exporter.py): API client, pagination, filtering, incremental/full sync, JSON output.
 - [traktv-importer.py](traktv-importer.py): import exported watch data into Trakt.tv.
 - [trakt-sonarr-nextup.py](trakt-sonarr-nextup.py): sync Trakt in-progress shows to a custom list for Sonarr.
+- [Dockerfile](Dockerfile) / [docker-entrypoint.sh](docker-entrypoint.sh): image entrypoint; one-shot or `CRON_SCHEDULE` via supercronic.
+- [docker-compose.yml](docker-compose.yml): example scheduled services.
 
 Not part of exporter flow:
 - [main.py](main.py): placeholder script.
